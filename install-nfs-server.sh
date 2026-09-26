@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="0.1.0"
+readonly SCRIPT_VERSION="0.2.0"
 readonly STATE_DIR="/etc/nfs-wg-manager"
 readonly WG_DIR="/etc/wireguard"
 readonly WG_INTERFACE="wg0"
@@ -29,10 +29,31 @@ NODE_NAME=""
 PRIVATE_KEY=""
 PUBLIC_KEY=""
 NFS_SERVICE=""
+ADD_CLIENT_PEER_MODE=0
+ADD_PEER_ROLLBACK=0
+ADD_PEER_BACKUP_DIR=""
+ADD_PEER_WG_STAGE=""
+ADD_PEER_EXPORTS_STAGE=""
+ADD_PEER_SYNC_FILE=""
+
+if [[ "${1:-}" == "--add-client-peer" ]]; then
+    ADD_CLIENT_PEER_MODE=1
+fi
 
 cleanup() {
+    if (( ADD_PEER_ROLLBACK )); then
+        rollback_client_peer_update
+    fi
     if [[ -n ${NEW_PEERS_FILE:-} && -e $NEW_PEERS_FILE ]]; then
         rm -f -- "$NEW_PEERS_FILE"
+    fi
+    [[ -z ${ADD_PEER_WG_STAGE:-} ]] || rm -f -- "$ADD_PEER_WG_STAGE"
+    if [[ -n ${ADD_PEER_EXPORTS_STAGE:-} ]]; then
+        rm -f -- "$ADD_PEER_EXPORTS_STAGE" "${ADD_PEER_EXPORTS_STAGE}.nfs-wg-manager.bak"
+    fi
+    [[ -z ${ADD_PEER_SYNC_FILE:-} ]] || rm -f -- "$ADD_PEER_SYNC_FILE"
+    if [[ -n ${ADD_PEER_BACKUP_DIR:-} && -d $ADD_PEER_BACKUP_DIR ]]; then
+        rm -rf -- "$ADD_PEER_BACKUP_DIR"
     fi
 }
 trap cleanup EXIT
@@ -55,7 +76,15 @@ usage() {
 用法：sudo bash install-nfs-server.sh
 
 脚本会交互式安装 WireGuard/NFS 服务端，并将输入的媒体目录以 NFSv4 根导出。
-默认媒体目录为 /srv/media；重新运行脚本可以重新输入客户端 Peer 清单。
+默认媒体目录为 /srv/media。
+
+已安装服务端后新增 Jellyfin 客户端 Peer：
+  sudo bash install-nfs-server.sh --add-client-peer \
+    --peer-name hhost_jf --peer-address 10.96.0.2 \
+    --public-key-file /root/hhost_jf.pub
+
+公钥文件必须只有一行 WireGuard 公钥。私钥必须留在客户端机器上。
+请传入客户端用 wg pubkey 派生的 .pub 文件，不要传 wg0.key；公钥和私钥编码相同，程序无法仅凭内容辨认误传的私钥。
 EOF
 }
 
@@ -69,29 +98,44 @@ if [[ "${1:-}" == "--version" ]]; then
     exit 0
 fi
 
+if [[ "${1:-}" == "--add-client-peer" && ( "${2:-}" == "--help" || "${2:-}" == "-h" ) ]]; then
+    usage
+    exit 0
+fi
+
 [[ $EUID -eq 0 ]] || die "请使用 root 运行此脚本。"
 [[ -r /etc/os-release ]] || die "找不到 /etc/os-release。"
-[[ -r /dev/tty ]] || die "需要交互终端；请直接在 VPS 上运行，或使用 curl | sudo bash。"
+if (( ! ADD_CLIENT_PEER_MODE )); then
+    [[ -r /dev/tty ]] || die "需要交互终端；请直接在 VPS 上运行，或使用 curl | sudo bash。"
+fi
 
 # shellcheck disable=SC1091
 . /etc/os-release
 case "${ID:-}" in
     debian)
-        [[ "${VERSION_ID%%.*}" =~ ^(11|12)$ ]] || die "仅支持 Debian 11/12，当前为 ${PRETTY_NAME:-unknown}。"
+        [[ "${VERSION_ID%%.*}" =~ ^(11|12|13)$ ]] || die "仅支持 Debian 11/12/13，当前为 ${PRETTY_NAME:-unknown}。"
         ;;
     ubuntu)
         [[ "${VERSION_ID%%.*}" =~ ^(20|22|24)$ ]] || die "仅支持 Ubuntu 20.04/22.04/24.04，当前为 ${PRETTY_NAME:-unknown}。"
         ;;
     *)
-        die "仅支持 Debian 11/12 和 Ubuntu 20.04/22.04/24.04，当前为 ${PRETTY_NAME:-unknown}。"
+        die "仅支持 Debian 11/12/13 和 Ubuntu 20.04/22.04/24.04，当前为 ${PRETTY_NAME:-unknown}。"
         ;;
 esac
 
-command -v apt-get >/dev/null 2>&1 || die "找不到 apt-get。"
-command -v systemctl >/dev/null 2>&1 || die "找不到 systemctl。"
+if (( ADD_CLIENT_PEER_MODE )); then
+    [[ -d $STATE_DIR ]] || die "尚未安装 NFS_Wireguard_Manager NFS 服务端。"
+else
+    command -v apt-get >/dev/null 2>&1 || die "找不到 apt-get。"
+    command -v systemctl >/dev/null 2>&1 || die "找不到 systemctl。"
+fi
 
-mkdir -p "$STATE_DIR" "$WG_DIR" "$NFS_CONF_DIR"
-chmod 0700 "$STATE_DIR"
+if (( ADD_CLIENT_PEER_MODE )); then
+    [[ -d $WG_DIR ]] || die "找不到 WireGuard 配置目录；请先完成 NFS Server 安装。"
+else
+    mkdir -p "$STATE_DIR" "$WG_DIR" "$NFS_CONF_DIR"
+    chmod 0700 "$STATE_DIR"
+fi
 umask 077
 
 exec 9>/run/lock/nfs-wg-manager.lock
@@ -298,6 +342,13 @@ peer_ip_exists_in_file() {
     awk -F'|' -v ip="$peer_ip" '$2 == ip {found=1} END {exit !found}' "$file"
 }
 
+peer_key_exists_in_file() {
+    local file=$1
+    local public_key=$2
+    [[ -f $file ]] || return 1
+    awk -F'|' -v key="$public_key" '$3 == key {found=1} END {exit !found}' "$file"
+}
+
 collect_peers() {
     local name peer_ip public_key old_ip old_key
     NEW_PEERS_FILE=$(mktemp "${STATE_DIR}/server-peers.XXXXXX")
@@ -308,7 +359,7 @@ collect_peers() {
     else
         : > "$NEW_PEERS_FILE"
         while :; do
-            name=$(prompt "Jellyfin 客户端 Peer 名称（留空结束）" "")
+            name=$(prompt "Jellyfin 客户端 Peer 名称（填写客户端节点名，例如 hhost_jf；留空结束）" "")
             [[ -z $name ]] && break
             valid_name "$name" || { warn "名称只能包含字母、数字、点、下划线和短横线。"; continue; }
             [[ $name != "$NODE_NAME" ]] || { warn "Peer 名称不能与本机相同。"; continue; }
@@ -316,12 +367,12 @@ collect_peers() {
 
             old_ip=$(old_peer_field "$name" 2 || true)
             old_key=$(old_peer_field "$name" 3 || true)
-            peer_ip=$(prompt "${name} 的 WireGuard IPv4 地址" "$old_ip")
+            peer_ip=$(prompt "Jellyfin 客户端 ${name} 的 WireGuard IPv4 地址（例如 10.96.0.2）" "$old_ip")
             valid_ipv4 "$peer_ip" || { warn "IPv4 地址无效。"; continue; }
             ipv4_in_cidr "$peer_ip" "$WG_SUBNET" || { warn "Peer 地址不在 WireGuard 网段 $WG_SUBNET 内。"; continue; }
             [[ $peer_ip != "$WG_ADDRESS" ]] || { warn "Peer 地址不能与本机相同。"; continue; }
             peer_ip_exists_in_file "$NEW_PEERS_FILE" "$peer_ip" && { warn "Peer WireGuard 地址重复。"; continue; }
-            public_key=$(prompt "${name} 的 WireGuard 公钥" "$old_key")
+            public_key=$(prompt "Jellyfin 客户端 ${name} 输出的 WireGuard 公钥（一行 44 字符，不是名称或 IP）" "$old_key")
             valid_key "$public_key" || { warn "WireGuard 公钥格式无效。"; continue; }
             printf '%s|%s|%s\n' "$name" "$peer_ip" "$public_key" >> "$NEW_PEERS_FILE"
         done
@@ -343,8 +394,10 @@ validate_peer_file() {
 }
 
 write_wg_config() {
+    local output=${1:-$WG_CONFIG}
+    local peers_file=${2:-$PEERS_FILE}
     local tmp name peer_ip public_key
-    tmp=$(mktemp "${WG_CONFIG}.XXXXXX")
+    tmp=$(mktemp "${output}.XXXXXX")
     {
         printf '%s\n' "$MANAGED_MARKER"
         printf '# Node: %s\n' "$NODE_NAME"
@@ -352,18 +405,18 @@ write_wg_config() {
         printf 'Address = %s/32\n' "$WG_ADDRESS"
         printf 'ListenPort = %s\n' "$WG_LISTEN_PORT"
         printf 'PrivateKey = %s\n' "$PRIVATE_KEY"
-        if [[ -s $PEERS_FILE ]]; then
+        if [[ -s $peers_file ]]; then
             while IFS='|' read -r name peer_ip public_key; do
                 [[ -n ${name:-} ]] || continue
                 printf '\n[Peer]\n'
                 printf '# %s\n' "$name"
                 printf 'PublicKey = %s\n' "$public_key"
                 printf 'AllowedIPs = %s/32\n' "$peer_ip"
-            done < "$PEERS_FILE"
+            done < "$peers_file"
         fi
     } > "$tmp"
     chmod 0600 "$tmp"
-    mv -f "$tmp" "$WG_CONFIG"
+    mv -f "$tmp" "$output"
 }
 
 write_nfs_config() {
@@ -392,21 +445,23 @@ EOF
 }
 
 write_exports() {
+    local output=${1:-/etc/exports}
+    local peers_file=${2:-$PEERS_FILE}
     local block="${EXPORTS_BEGIN}" name peer_ip public_key
     block+=$'\n'
-    if [[ -s $PEERS_FILE ]]; then
+    if [[ -s $peers_file ]]; then
         block+="${MEDIA_ROOT}"
         while IFS='|' read -r name peer_ip public_key; do
             [[ -n ${name:-} ]] || continue
             block+=" ${peer_ip}/32(ro,sync,root_squash,no_subtree_check,fsid=0)"
-        done < "$PEERS_FILE"
+        done < "$peers_file"
         block+=$'\n'
     else
-        block+="# 尚未配置 Jellyfin 客户端 Peer；重新运行脚本后添加客户端。"
+        block+="# 尚未配置 Jellyfin 客户端 Peer；使用 --add-client-peer 添加客户端。"
         block+=$'\n'
     fi
     block+="$EXPORTS_END"
-    replace_block /etc/exports "$EXPORTS_BEGIN" "$EXPORTS_END" "$block"
+    replace_block "$output" "$EXPORTS_BEGIN" "$EXPORTS_END" "$block"
 }
 
 find_nfs_service() {
@@ -444,17 +499,157 @@ install_packages() {
     apt-get install -y wireguard nfs-kernel-server
 }
 
+rollback_client_peer_update() {
+    local sync_file=""
+    if [[ -n ${ADD_PEER_BACKUP_DIR:-} && -d $ADD_PEER_BACKUP_DIR ]]; then
+        cp -a "$ADD_PEER_BACKUP_DIR/peers.tsv" "$PEERS_FILE" || warn "恢复 Peer 清单失败。"
+        cp -a "$ADD_PEER_BACKUP_DIR/wg0.conf" "$WG_CONFIG" || warn "恢复 WireGuard 配置失败。"
+        cp -a "$ADD_PEER_BACKUP_DIR/exports" /etc/exports || warn "恢复 NFS 导出配置失败。"
+    fi
+
+    if command -v wg-quick >/dev/null 2>&1 && command -v wg >/dev/null 2>&1 && wg show "$WG_INTERFACE" >/dev/null 2>&1; then
+        if sync_file=$(mktemp "${WG_CONFIG}.rollback.XXXXXX" 2>/dev/null); then
+            if wg-quick strip "$WG_INTERFACE" > "$sync_file"; then
+                wg syncconf "$WG_INTERFACE" "$sync_file" || warn "已恢复文件，但恢复 WireGuard 运行状态失败。"
+            else
+                warn "已恢复文件，但无法生成 WireGuard 回滚配置。"
+            fi
+            rm -f -- "$sync_file"
+        else
+            warn "已恢复文件，但无法创建 WireGuard 回滚临时文件。"
+        fi
+    fi
+    if command -v exportfs >/dev/null 2>&1; then
+        exportfs -ra || warn "已恢复文件，但重新加载 NFS 导出失败。"
+    fi
+    ADD_PEER_ROLLBACK=0
+}
+
+add_client_peer() {
+    local peer_name="" peer_address="" public_key_file="" public_key=""
+    local key_file_size
+    local -a public_key_lines=()
+
+    while (($#)); do
+        case "$1" in
+            --peer-name)
+                (($# >= 2)) || die "--peer-name 缺少参数。"
+                peer_name=$2
+                shift 2
+                ;;
+            --peer-address)
+                (($# >= 2)) || die "--peer-address 缺少参数。"
+                peer_address=$2
+                shift 2
+                ;;
+            --public-key-file)
+                (($# >= 2)) || die "--public-key-file 缺少参数。"
+                public_key_file=$2
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                return 0
+                ;;
+            *)
+                die "未知参数：$1。请使用 --help 查看 Peer 添加用法。"
+                ;;
+        esac
+    done
+
+    [[ -n $peer_name ]] || die "必须提供 --peer-name。"
+    [[ -n $peer_address ]] || die "必须提供 --peer-address。"
+    [[ -n $public_key_file ]] || die "必须提供 --public-key-file。"
+    valid_name "$peer_name" || die "客户端 Peer 名称无效。"
+    valid_ipv4 "$peer_address" || die "客户端 Peer IPv4 地址无效。"
+    [[ $public_key_file == *.pub ]] || die "公钥文件名必须以 .pub 结尾；请勿指定 wg0.key。"
+    [[ -f $public_key_file && -r $public_key_file ]] || die "公钥文件不存在或不可读：$public_key_file。"
+    key_file_size=$(wc -c < "$public_key_file") || die "读取公钥文件失败。"
+    (( key_file_size <= 256 )) || die "公钥文件过大；文件应只有一行公钥。"
+    mapfile -t public_key_lines < "$public_key_file" || die "读取公钥文件失败。"
+    [[ ${#public_key_lines[@]} -eq 1 ]] || die "公钥文件必须恰好只有一行 WireGuard 公钥。"
+    public_key=${public_key_lines[0]}
+    valid_key "$public_key" || die "公钥格式无效；请使用客户端脚本输出的 44 字符 WireGuard 公钥。"
+
+    [[ -f $NODE_FILE && -f $PEERS_FILE && -s $WG_CONFIG && -f /etc/exports ]] || die "服务端配置不完整；请先完成 NFS Server 安装。"
+    grep -qF "$MANAGED_MARKER" "$WG_CONFIG" || die "$WG_CONFIG 不是本工具生成的配置；为避免覆盖现有设置，已停止。"
+    [[ -s $WG_KEY_FILE ]] || die "找不到服务端 WireGuard 私钥文件；请先完成 NFS Server 安装。"
+    command -v wg >/dev/null 2>&1 || die "找不到 wg 命令。"
+    command -v wg-quick >/dev/null 2>&1 || die "找不到 wg-quick 命令。"
+    command -v exportfs >/dev/null 2>&1 || die "找不到 exportfs 命令。"
+    wg show "$WG_INTERFACE" >/dev/null 2>&1 || die "WireGuard 接口 $WG_INTERFACE 未运行；请先检查 NFS Server 服务。"
+
+    NODE_NAME=$(state_get NODE_NAME "$NODE_FILE" || true)
+    WG_ADDRESS=$(state_get WG_ADDRESS "$NODE_FILE" || true)
+    WG_SUBNET=$(state_get WG_SUBNET "$NODE_FILE" || true)
+    WG_LISTEN_PORT=$(state_get WG_LISTEN_PORT "$NODE_FILE" || true)
+    MEDIA_ROOT=$(state_get MEDIA_ROOT "$NODE_FILE" || true)
+    valid_name "$NODE_NAME" || die "服务端节点状态无效。"
+    valid_ipv4 "$WG_ADDRESS" || die "服务端 WireGuard 地址状态无效。"
+    valid_cidr "$WG_SUBNET" || die "服务端 WireGuard 网段状态无效。"
+    ipv4_in_cidr "$WG_ADDRESS" "$WG_SUBNET" || die "服务端 WireGuard 地址不在已保存网段内。"
+    valid_port "$WG_LISTEN_PORT" || die "服务端 WireGuard 端口状态无效。"
+    valid_abs_path "$MEDIA_ROOT" || die "NFS 媒体目录状态无效。"
+    [[ $peer_name != "$NODE_NAME" ]] || die "客户端 Peer 名称不能与服务端节点名相同。"
+    ipv4_in_cidr "$peer_address" "$WG_SUBNET" || die "客户端地址 $peer_address 不在已配置网段 $WG_SUBNET 内。"
+    [[ $peer_address != "$WG_ADDRESS" ]] || die "客户端地址不能与服务端地址相同。"
+    peer_exists_in_file "$PEERS_FILE" "$peer_name" && die "客户端 Peer 名称已存在：$peer_name。"
+    peer_ip_exists_in_file "$PEERS_FILE" "$peer_address" && die "客户端 WireGuard 地址已被使用：$peer_address。"
+    peer_key_exists_in_file "$PEERS_FILE" "$public_key" && die "该公钥已存在于客户端 Peer 清单中。"
+
+    PRIVATE_KEY=$(<"$WG_KEY_FILE")
+    [[ -n $PRIVATE_KEY ]] || die "服务端 WireGuard 私钥为空。"
+    printf '%s' "$PRIVATE_KEY" | wg pubkey >/dev/null || die "服务端 WireGuard 私钥无效。"
+
+    NEW_PEERS_FILE=$(mktemp "${STATE_DIR}/server-peers.XXXXXX")
+    chmod 0600 "$NEW_PEERS_FILE"
+    cp -f "$PEERS_FILE" "$NEW_PEERS_FILE"
+    printf '%s|%s|%s\n' "$peer_name" "$peer_address" "$public_key" >> "$NEW_PEERS_FILE"
+    validate_peer_file
+
+    ADD_PEER_WG_STAGE=$(mktemp "${WG_CONFIG}.stage.XXXXXX")
+    write_wg_config "$ADD_PEER_WG_STAGE" "$NEW_PEERS_FILE"
+    ADD_PEER_EXPORTS_STAGE=$(mktemp /etc/exports.nwm-stage.XXXXXX)
+    cp -a /etc/exports "$ADD_PEER_EXPORTS_STAGE"
+    write_exports "$ADD_PEER_EXPORTS_STAGE" "$NEW_PEERS_FILE"
+
+    ADD_PEER_BACKUP_DIR=$(mktemp -d "${STATE_DIR}/.add-client-peer.XXXXXX")
+    cp -a "$PEERS_FILE" "$ADD_PEER_BACKUP_DIR/peers.tsv"
+    cp -a "$WG_CONFIG" "$ADD_PEER_BACKUP_DIR/wg0.conf"
+    cp -a /etc/exports "$ADD_PEER_BACKUP_DIR/exports"
+
+    ADD_PEER_ROLLBACK=1
+    mv -f "$NEW_PEERS_FILE" "$PEERS_FILE"
+    mv -f "$ADD_PEER_WG_STAGE" "$WG_CONFIG"
+    mv -f "$ADD_PEER_EXPORTS_STAGE" /etc/exports
+
+    ADD_PEER_SYNC_FILE=$(mktemp "${WG_CONFIG}.syncconf.XXXXXX")
+    wg-quick strip "$WG_INTERFACE" > "$ADD_PEER_SYNC_FILE" || die "生成 WireGuard 运行配置失败。"
+    wg syncconf "$WG_INTERFACE" "$ADD_PEER_SYNC_FILE" || die "应用 WireGuard 客户端 Peer 失败。"
+    exportfs -ra || die "重新加载 NFS 导出失败。"
+    ADD_PEER_ROLLBACK=0
+
+    info "已添加客户端 Peer：${peer_name} (${peer_address})。"
+    info "WireGuard 和 NFS 导出已在线更新；无需重新安装软件包。"
+}
+
 main() {
     local current
+    if [[ "${1:-}" == "--add-client-peer" ]]; then
+        shift
+        add_client_peer "$@"
+        return
+    fi
+    (($# == 0)) || die "不支持的位置参数；请使用 --help 查看用法。"
     install_packages
     ensure_manager_wg_config
 
     current=$(state_get NODE_NAME "$NODE_FILE" || true)
-    NODE_NAME=$(prompt "本机节点名称" "$current")
+    NODE_NAME=$(prompt "本机节点名称（NFS Server 示例：ddps_nft）" "$current")
     valid_name "$NODE_NAME" || die "节点名称无效。"
 
     current=$(state_get WG_ADDRESS "$NODE_FILE" || true)
-    WG_ADDRESS=$(prompt "本机 WireGuard IPv4 地址" "$current")
+    WG_ADDRESS=$(prompt "本机 WireGuard IPv4 地址（NFS Server 示例：10.96.0.1）" "$current")
     valid_ipv4 "$WG_ADDRESS" || die "WireGuard IPv4 地址无效。"
 
     current=$(state_get WG_SUBNET "$NODE_FILE" || true)
@@ -491,12 +686,7 @@ main() {
     printf 'WireGuard 端口：%s/udp\n' "$WG_LISTEN_PORT"
     printf 'NFS 媒体目录：%s\n' "$MEDIA_ROOT"
     printf 'NFS 服务端口：%s/tcp\n' "$NFS_PORT"
-    printf '\n下一步：将本机公钥和 Endpoint 信息填入 Jellyfin 客户端脚本，并在本机 nftables 放行 wg0 上的 TCP 8388。\n'
+    printf '\n下一步：在 Jellyfin 客户端 Peer 中填写本机节点名、公钥和公网 Endpoint；在本机 nftables 放行 wg0 上的 TCP 8388。\n'
 }
 
 main "$@"
-
-
-
-
-

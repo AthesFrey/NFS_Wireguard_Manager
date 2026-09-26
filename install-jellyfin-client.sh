@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="0.1.0"
+readonly SCRIPT_VERSION="0.2.0"
 readonly STATE_DIR="/etc/nfs-wg-manager"
 readonly WG_DIR="/etc/wireguard"
 readonly WG_INTERFACE="wg0"
@@ -59,7 +59,7 @@ usage() {
 用法：sudo bash install-jellyfin-client.sh
 
 脚本会交互式安装 WireGuard/NFS 客户端，并配置 Jellyfin 宿主机上的 NFS 挂载。
-重新运行脚本可以重新输入完整 Peer 清单；本机 WireGuard 私钥会保留。
+重新运行本脚本可以重新输入 NFS Server Peer 清单；本机 WireGuard 私钥会保留。
 EOF
 }
 
@@ -81,13 +81,13 @@ fi
 . /etc/os-release
 case "${ID:-}" in
     debian)
-        [[ "${VERSION_ID%%.*}" =~ ^(11|12)$ ]] || die "仅支持 Debian 11/12，当前为 ${PRETTY_NAME:-unknown}。"
+        [[ "${VERSION_ID%%.*}" =~ ^(11|12|13)$ ]] || die "仅支持 Debian 11/12/13，当前为 ${PRETTY_NAME:-unknown}。"
         ;;
     ubuntu)
         [[ "${VERSION_ID%%.*}" =~ ^(20|22|24)$ ]] || die "仅支持 Ubuntu 20.04/22.04/24.04，当前为 ${PRETTY_NAME:-unknown}。"
         ;;
     *)
-        die "仅支持 Debian 11/12 和 Ubuntu 20.04/22.04/24.04，当前为 ${PRETTY_NAME:-unknown}。"
+        die "仅支持 Debian 11/12/13 和 Ubuntu 20.04/22.04/24.04，当前为 ${PRETTY_NAME:-unknown}。"
         ;;
 esac
 
@@ -356,7 +356,7 @@ collect_peers() {
     else
         : > "$NEW_PEERS_FILE"
         while :; do
-            name=$(prompt "NFS Server Peer 名称（留空结束）" "")
+            name=$(prompt "NFS Server Peer 名称（填写服务端节点名，例如 ddps_nft；留空结束）" "")
             [[ -z $name ]] && break
             valid_name "$name" || { warn "名称只能包含字母、数字、点、下划线和短横线。"; continue; }
             [[ $name != "$NODE_NAME" ]] || { warn "Peer 名称不能与本机相同。"; continue; }
@@ -367,14 +367,14 @@ collect_peers() {
             old_endpoint=$(old_peer_field "$name" 4 || true)
             old_mount=$(old_peer_field "$name" 5 || true)
 
-            peer_ip=$(prompt "${name} 的 WireGuard IPv4 地址" "$old_ip")
+            peer_ip=$(prompt "NFS Server ${name} 的 WireGuard IPv4 地址（例如 10.96.0.1）" "$old_ip")
             valid_ipv4 "$peer_ip" || { warn "IPv4 地址无效。"; continue; }
             ipv4_in_cidr "$peer_ip" "$WG_SUBNET" || { warn "Peer 地址不在 WireGuard 网段 $WG_SUBNET 内。"; continue; }
             [[ $peer_ip != "$WG_ADDRESS" ]] || { warn "Peer 地址不能与本机相同。"; continue; }
             peer_ip_exists_in_file "$NEW_PEERS_FILE" "$peer_ip" && { warn "Peer WireGuard 地址重复。"; continue; }
-            public_key=$(prompt "${name} 的 WireGuard 公钥" "$old_key")
+            public_key=$(prompt "NFS Server ${name} 输出的 WireGuard 公钥（一行 44 字符，不是名称或 IP）" "$old_key")
             valid_key "$public_key" || { warn "WireGuard 公钥格式无效。"; continue; }
-            endpoint=$(prompt "${name} 的公网 Endpoint（host:port）" "$old_endpoint")
+            endpoint=$(prompt "NFS Server ${name} 的公网 Endpoint（公网 IP 或域名:35669，例如 203.0.113.10:35669）" "$old_endpoint")
             valid_endpoint "$endpoint" || { warn "Endpoint 必须是 host:port，端口范围 1-65535。"; continue; }
             mount_path=$(prompt "${name} 的本地挂载目录" "${old_mount:-${MEDIA_ROOT}/${name}}")
             valid_mount_path "$mount_path" || { warn "挂载目录必须位于 Jellyfin 媒体根目录 $MEDIA_ROOT 下，且只能包含安全路径字符。"; continue; }
@@ -582,11 +582,11 @@ main() {
     ensure_manager_wg_config
 
     current=$(state_get NODE_NAME "$NODE_FILE" || true)
-    NODE_NAME=$(prompt "本机节点名称" "$current")
+    NODE_NAME=$(prompt "本机节点名称（Jellyfin 客户端示例：hhost_jf）" "$current")
     valid_name "$NODE_NAME" || die "节点名称无效。"
 
     current=$(state_get WG_ADDRESS "$NODE_FILE" || true)
-    WG_ADDRESS=$(prompt "本机 WireGuard IPv4 地址" "$current")
+    WG_ADDRESS=$(prompt "本机 WireGuard IPv4 地址（Jellyfin 客户端示例：10.96.0.2）" "$current")
     valid_ipv4 "$WG_ADDRESS" || die "WireGuard IPv4 地址无效。"
 
     current=$(state_get WG_SUBNET "$NODE_FILE" || true)
@@ -630,7 +630,7 @@ main() {
     printf 'WireGuard 端口：%s/udp\n' "$WG_LISTEN_PORT"
     printf 'NFS 服务端口：%s/tcp\n' "$NFS_PORT"
     printf '活跃 NFS 挂载：%s\n' "$ACTIVE_MOUNTS"
-    printf '\n下一步：将本机公钥加入每个 NFS Server 的 Peer 清单，然后检查 wg show、findmnt 和 docker exec。\n'
+    printf '\n下一步：把本机 WireGuard 公钥加入每个 NFS Server 的客户端 Peer；可使用服务端脚本的 --add-client-peer 模式，然后检查 wg show、findmnt 和 docker exec。\n'
 }
 
 main "$@"
