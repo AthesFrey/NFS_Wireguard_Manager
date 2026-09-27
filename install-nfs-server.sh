@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="0.2.0"
+readonly SCRIPT_VERSION="3.0.0"
 readonly STATE_DIR="/etc/nfs-wg-manager"
 readonly WG_DIR="/etc/wireguard"
 readonly WG_INTERFACE="wg0"
@@ -76,11 +76,11 @@ usage() {
 用法：sudo bash install-nfs-server.sh
 
 脚本会交互式安装 WireGuard/NFS 服务端，并将输入的媒体目录以 NFSv4 根导出。
-默认媒体目录为 /srv/media。
+首次安装可隐藏粘贴本机离线私钥；直接回车则自动生成。默认媒体目录为 /srv/media。
 
 已安装服务端后新增 Jellyfin 客户端 Peer：
   sudo bash install-nfs-server.sh --add-client-peer \
-    --peer-name hhost_jf --peer-address 10.96.0.2 \
+    --peer-name hhost_jf --peer-address 10.96.0.1 \
     --public-key-file /root/hhost_jf.pub
 
 公钥文件必须只有一行 WireGuard 公钥。私钥必须留在客户端机器上。
@@ -157,6 +157,15 @@ prompt() {
     if [[ -z $value ]]; then
         value=$default
     fi
+    printf '%s' "$value"
+}
+
+prompt_secret() {
+    local label=$1
+    local value
+    printf '%s: ' "$label" >/dev/tty
+    IFS= read -r -s value </dev/tty || die "读取交互输入失败。"
+    printf '\n' >/dev/tty
     printf '%s' "$value"
 }
 
@@ -287,24 +296,40 @@ ensure_manager_wg_config() {
 }
 
 load_or_create_key() {
-    local key_tmp
+    local key_tmp=""
+    local save_key=0
     if [[ -s $WG_KEY_FILE ]]; then
         PRIVATE_KEY=$(<"$WG_KEY_FILE")
     elif [[ -f $WG_CONFIG ]]; then
         PRIVATE_KEY=$(awk -F'= ' '/^[[:space:]]*PrivateKey[[:space:]]*=/ {print $2; exit}' "$WG_CONFIG")
         [[ -n $PRIVATE_KEY ]] || die "无法从现有管理配置恢复 WireGuard 私钥。"
-        printf '%s\n' "$PRIVATE_KEY" > "$WG_KEY_FILE"
-        chmod 0600 "$WG_KEY_FILE"
+        save_key=1
     else
         command -v wg >/dev/null 2>&1 || die "安装 wireguard 后仍找不到 wg 命令。"
+        PRIVATE_KEY=$(prompt_secret "输入本机 WireGuard 私钥（隐藏输入；回车自动生成）" "")
         key_tmp=$(mktemp "${WG_KEY_FILE}.XXXXXX")
-        wg genkey > "$key_tmp"
+        if [[ -n $PRIVATE_KEY ]]; then
+            printf '%s\n' "$PRIVATE_KEY" > "$key_tmp"
+        else
+            wg genkey > "$key_tmp" || { rm -f -- "$key_tmp"; die "生成 WireGuard 私钥失败。"; }
+        fi
         chmod 0600 "$key_tmp"
-        mv -f "$key_tmp" "$WG_KEY_FILE"
-        PRIVATE_KEY=$(<"$WG_KEY_FILE")
+        PRIVATE_KEY=$(<"$key_tmp")
+        save_key=1
     fi
     [[ -n $PRIVATE_KEY ]] || die "WireGuard 私钥为空。"
-    PUBLIC_KEY=$(printf '%s' "$PRIVATE_KEY" | wg pubkey)
+    PUBLIC_KEY=$(printf '%s' "$PRIVATE_KEY" | wg pubkey) || {
+        [[ -z $key_tmp ]] || rm -f -- "$key_tmp"
+        die "WireGuard 私钥无效；请粘贴本机的一行私钥。"
+    }
+    if (( save_key )); then
+        if [[ -z $key_tmp ]]; then
+            key_tmp=$(mktemp "${WG_KEY_FILE}.XXXXXX")
+            printf '%s\n' "$PRIVATE_KEY" > "$key_tmp"
+            chmod 0600 "$key_tmp"
+        fi
+        mv -f "$key_tmp" "$WG_KEY_FILE"
+    fi
 }
 
 save_node_state() {
@@ -367,7 +392,7 @@ collect_peers() {
 
             old_ip=$(old_peer_field "$name" 2 || true)
             old_key=$(old_peer_field "$name" 3 || true)
-            peer_ip=$(prompt "Jellyfin 客户端 ${name} 的 WireGuard IPv4 地址（例如 10.96.0.2）" "$old_ip")
+            peer_ip=$(prompt "Jellyfin 客户端 ${name} 的 WireGuard IPv4 地址（例如 10.96.0.1）" "${old_ip:-10.96.0.1}")
             valid_ipv4 "$peer_ip" || { warn "IPv4 地址无效。"; continue; }
             ipv4_in_cidr "$peer_ip" "$WG_SUBNET" || { warn "Peer 地址不在 WireGuard 网段 $WG_SUBNET 内。"; continue; }
             [[ $peer_ip != "$WG_ADDRESS" ]] || { warn "Peer 地址不能与本机相同。"; continue; }
@@ -645,11 +670,11 @@ main() {
     ensure_manager_wg_config
 
     current=$(state_get NODE_NAME "$NODE_FILE" || true)
-    NODE_NAME=$(prompt "本机节点名称（NFS Server 示例：ddps_nft）" "$current")
+    NODE_NAME=$(prompt "本机节点名称（NFS Server 示例：ddps_nft）" "${current:-ddps_nft}")
     valid_name "$NODE_NAME" || die "节点名称无效。"
 
     current=$(state_get WG_ADDRESS "$NODE_FILE" || true)
-    WG_ADDRESS=$(prompt "本机 WireGuard IPv4 地址（NFS Server 示例：10.96.0.1）" "$current")
+    WG_ADDRESS=$(prompt "本机 WireGuard IPv4 地址（NFS Server 示例：10.96.0.2）" "${current:-10.96.0.2}")
     valid_ipv4 "$WG_ADDRESS" || die "WireGuard IPv4 地址无效。"
 
     current=$(state_get WG_SUBNET "$NODE_FILE" || true)
@@ -686,7 +711,7 @@ main() {
     printf 'WireGuard 端口：%s/udp\n' "$WG_LISTEN_PORT"
     printf 'NFS 媒体目录：%s\n' "$MEDIA_ROOT"
     printf 'NFS 服务端口：%s/tcp\n' "$NFS_PORT"
-    printf '\n下一步：在 Jellyfin 客户端 Peer 中填写本机节点名、公钥和公网 Endpoint；在本机 nftables 放行 wg0 上的 TCP 8388。\n'
+    printf '\n下一步：在 Jellyfin 客户端 Peer 中填写本机公钥和公网 Endpoint；若本次已在客户端 Peer 清单中录入客户端公钥，无需再运行添加命令。在本机 nftables 放行 wg0 上的 TCP 8388。\n'
 }
 
 main "$@"
