@@ -3,6 +3,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly SCRIPT_VERSION="3.1.0"
+readonly ROLE="server"
+readonly RUNTIME_DIR="/usr/local/libexec/nfs-wg-manager"
 readonly STATE_DIR="/etc/nfs-wg-manager"
 readonly WG_DIR="/etc/wireguard"
 readonly WG_INTERFACE="wg0"
@@ -30,7 +32,12 @@ PRIVATE_KEY=""
 PUBLIC_KEY=""
 NFS_SERVICE=""
 ADD_CLIENT_PEER_MODE=0
+APPLY_FIREWALL_MODE=0
+[[ ${1:-} != --apply-firewall ]] || APPLY_FIREWALL_MODE=1
 ADD_PEER_ROLLBACK=0
+ADD_PEER_ROUTE_ADDED=0
+ADD_PEER_ADDRESS=""
+NFS_LEGACY_CONFIG=0
 ADD_PEER_BACKUP_DIR=""
 ADD_PEER_WG_STAGE=""
 ADD_PEER_EXPORTS_STAGE=""
@@ -78,6 +85,9 @@ usage() {
 脚本会交互式安装 WireGuard/NFS 服务端，并将输入的媒体目录以 NFSv4 根导出。
 首次安装可隐藏粘贴本机离线私钥；直接回车则自动生成。默认媒体目录为 /srv/media。
 
+恢复隧道内防火墙规则：sudo bash install-nfs-server.sh --apply-firewall
+公网 UDP 端口需自行放行；脚本仅管理 wg0 上的 NFS TCP 8388。
+
 已安装服务端后新增 Jellyfin 客户端 Peer：
   sudo bash install-nfs-server.sh --add-client-peer \
     --peer-name hhost_jf --peer-address 10.96.0.1 \
@@ -105,7 +115,7 @@ fi
 
 [[ $EUID -eq 0 ]] || die "请使用 root 运行此脚本。"
 [[ -r /etc/os-release ]] || die "找不到 /etc/os-release。"
-if (( ! ADD_CLIENT_PEER_MODE )); then
+if (( ! ADD_CLIENT_PEER_MODE && ! APPLY_FIREWALL_MODE )); then
     [[ -r /dev/tty ]] || die "需要交互终端；请直接在 VPS 上运行，或使用 curl | sudo bash。"
 fi
 
@@ -123,14 +133,14 @@ case "${ID:-}" in
         ;;
 esac
 
-if (( ADD_CLIENT_PEER_MODE )); then
+if (( ADD_CLIENT_PEER_MODE || APPLY_FIREWALL_MODE )); then
     [[ -d $STATE_DIR ]] || die "尚未安装 NFS_Wireguard_Manager NFS 服务端。"
 else
     command -v apt-get >/dev/null 2>&1 || die "找不到 apt-get。"
     command -v systemctl >/dev/null 2>&1 || die "找不到 systemctl。"
 fi
 
-if (( ADD_CLIENT_PEER_MODE )); then
+if (( ADD_CLIENT_PEER_MODE || APPLY_FIREWALL_MODE )); then
     [[ -d $WG_DIR ]] || die "找不到 WireGuard 配置目录；请先完成 NFS Server 安装。"
 else
     mkdir -p "$STATE_DIR" "$WG_DIR" "$NFS_CONF_DIR"
@@ -194,11 +204,11 @@ valid_ipv4() {
     local ip=$1
     local part
     local -a octets
-    [[ $ip =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+    [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
     IFS=. read -r -a octets <<< "$ip"
     [[ ${#octets[@]} -eq 4 ]] || return 1
     for part in "${octets[@]}"; do
-        [[ $part =~ ^[0-9]+$ ]] || return 1
+        [[ $part == 0 || $part =~ ^[1-9][0-9]{0,2}$ ]] || return 1
         ((10#$part <= 255)) || return 1
     done
 }
@@ -208,7 +218,7 @@ valid_cidr() {
     local ip=${cidr%/*}
     local prefix=${cidr##*/}
     valid_ipv4 "$ip" || return 1
-    [[ $prefix =~ ^[0-9]+$ ]] || return 1
+    [[ $cidr == */* && $prefix =~ ^[1-9][0-9]?$ ]] || return 1
     ((10#$prefix >= 1 && 10#$prefix <= 32))
 }
 
@@ -238,13 +248,13 @@ ipv4_in_cidr() {
 
 valid_port() {
     local port=$1
-    [[ $port =~ ^[0-9]+$ ]] || return 1
+    [[ $port =~ ^[1-9][0-9]{0,4}$ ]] || return 1
     ((10#$port >= 1 && 10#$port <= 65535))
 }
 
 valid_key() {
     local key=$1
-    [[ ${#key} -eq 44 && $key =~ ^[A-Za-z0-9+/]{43}=$ ]]
+    [[ ${#key} -eq 44 && $key =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]]
 }
 
 valid_abs_path() {
@@ -348,10 +358,222 @@ load_or_create_key() {
     fi
 }
 
+write_managed_file() {
+    local output=$1 mode=${2:-0644} tmp
+    if [[ -e $output ]] && ! grep -qF "$MANAGED_MARKER" "$output"; then
+        die "$output 已存在且不是本工具生成的文件。"
+    fi
+    mkdir -p "$(dirname "$output")"
+    tmp=$(mktemp "${output}.XXXXXX")
+    cat > "$tmp"
+    chmod "$mode" "$tmp"
+    backup_once "$output"
+    mv -f "$tmp" "$output"
+}
+
+apply_saved_firewall() {
+    [[ -x $RUNTIME_DIR/firewall && -f $NODE_FILE ]] || die "请先完整运行一次本版本安装器。"
+    [[ $(state_get ROLE "$NODE_FILE") == "$ROLE" ]] || die "本机保存的节点角色与此安装入口不符。"
+    "$RUNTIME_DIR/firewall"
+    info "已重新应用 wg0 上的 NFS 防火墙规则；公网 UDP 规则由你管理。"
+}
+
+install_firewall_support() {
+    write_managed_file "$RUNTIME_DIR/firewall" 0755 <<'NWM_FIREWALL_PY'
+#!/usr/bin/python3
+# Managed by NFS_Wireguard_Manager
+"""Reconcile only NFS-over-WireGuard rules; never open the public UDP port."""
+import fcntl
+import ipaddress
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+STATE = pathlib.Path('/etc/nfs-wg-manager')
+LOCK = '/run/nfs-wg-manager-firewall.lock'
+TABLE = 'nfs_wg_manager'
+MARK = 'nfs-wg-manager:'
+
+
+def run(argv, data=None):
+    p = subprocess.run(argv, input=data, text=True, capture_output=True)
+    if p.returncode:
+        raise RuntimeError(' '.join(argv[:3]) + ': ' + p.stderr.strip())
+    return p
+
+
+def settings():
+    node = dict(line.split('=', 1) for line in (STATE / 'node.conf').read_text().splitlines() if '=' in line)
+    role = node.get('ROLE')
+    if role not in ('server', 'client'):
+        raise ValueError('缺少节点角色，请先运行对应安装器。')
+    address = str(ipaddress.IPv4Address(node['WG_ADDRESS']))
+    peers = []
+    for line in (STATE / (role + '-peers.tsv')).read_text().splitlines():
+        if not line:
+            continue
+        fields = line.split('|')
+        if len(fields) != (3 if role == 'server' else 5):
+            raise ValueError('Peer 清单字段数量错误。')
+        peer = str(ipaddress.IPv4Address(fields[1]))
+        if peer == address or peer in peers:
+            raise ValueError('Peer 地址与本机冲突或重复。')
+        peers.append(peer)
+    return role, address, peers
+
+
+def match(left, right):
+    return {'match': {'op': '==', 'left': left, 'right': right}}
+
+
+def packet(protocol, field):
+    return {'payload': {'protocol': protocol, 'field': field}}
+
+
+def flow(role, address, peers, direction):
+    incoming = direction == 'input'
+    request = (role == 'server') == incoming
+    expr = [match({'meta': {'key': 'iifname' if incoming else 'oifname'}}, 'wg0'),
+            match(packet('ip', 'saddr' if incoming else 'daddr'), {'set': peers}),
+            match(packet('ip', 'daddr' if incoming else 'saddr'), address),
+            match({'meta': {'key': 'l4proto'}}, 'tcp'),
+            match(packet('tcp', 'dport' if request else 'sport'), 8388)]
+    if not request:
+        expr.append(match({'ct': {'key': 'state'}}, {'set': ['established', 'related']}))
+    return expr + [{'counter': None}, {'accept': None}]
+
+
+def transaction(snapshot, role, address, peers, compat=()):
+    objects = snapshot['nftables']
+    chains = [o['chain'] for o in objects if 'chain' in o]
+    rules = [o['rule'] for o in objects if 'rule' in o]
+    own = [o for o in objects if any(isinstance(v, dict) and v.get('family') == 'inet'
+           and (v.get('table') == TABLE or (k == 'table' and v.get('name') == TABLE))
+           for k, v in o.items())]
+    if own:
+        # The name is reserved, but it must never authorize erasing foreign data.
+        own_chains = [o['chain'] for o in own if 'chain' in o]
+        if {c['name'] for c in own_chains} != {'input', 'output'}:
+            raise ValueError('保留表名 nfs_wg_manager 已被其他规则占用。')
+        for o in own:
+            if 'chain' in o:
+                c = o['chain']
+                if (c.get('hook') != c['name'] or c.get('type') != 'filter'
+                        or c.get('policy') != 'accept' or c.get('prio') != -10):
+                    raise ValueError('本工程防火墙表的结构已被修改。')
+            elif 'rule' in o:
+                if not o['rule'].get('comment', '').startswith(MARK):
+                    raise ValueError('本工程防火墙表含有外部规则，停止更新。')
+            elif 'table' not in o:
+                raise ValueError('本工程防火墙表含有外部对象，停止更新。')
+    targets = []
+    for c in chains:
+        if c.get('family') == 'netdev' and c.get('hook') in ('ingress', 'egress') and ('wg0' == c.get('dev') or 'wg0' in c.get('devices', [])):
+            raise ValueError('wg0 存在 netdev 过滤链，请先核对该链；未自动混用。')
+        if c.get('family') not in ('ip', 'inet') or (c['family'], c.get('table')) == ('inet', TABLE) or 'hook' not in c:
+            continue
+        members = [r for r in rules if all(r.get(k) == c.get(k) for k in ('family', 'table')) and r['chain'] == c['name']]
+        external = [r for r in members if not r.get('comment', '').startswith(MARK)]
+        if c['hook'] not in ('input', 'output'):
+            # NAT and Docker forwarding are outside this tool's ownership.
+            if c.get('type') == 'filter' and c['hook'] in ('ingress', 'prerouting', 'postrouting') and (external or c.get('policy') == 'drop'):
+                raise ValueError('存在额外的前置或后置过滤链 %s/%s/%s；请先核对其对 wg0 的限制。' % (c['family'], c['table'], c['name']))
+            continue
+        if c.get('type') != 'filter':
+            if c.get('type') == 'route' and (external or c.get('policy') == 'drop'):
+                raise ValueError('存在额外的 output route 过滤链，请先核对其对 wg0 的限制。')
+            continue
+        if (c['family'], c['table']) in compat:
+            if c.get('policy') == 'accept' and not external:
+                continue
+            raise ValueError('主机过滤链由 iptables 管理，不能自动混用：' + c['table'] + '/' + c['name'])
+        if any('ufw' in str(x).lower() or 'firewalld' in str(x).lower() for x in (c['table'], c['name'], external)):
+            raise ValueError('检测到 UFW/firewalld 托管规则，请使用原生 nftables 主机过滤规则。')
+        targets.append(c)
+    commands = []
+    for r in rules:
+        if r.get('comment', '').startswith(MARK) and not (r['family'] == 'inet' and r['table'] == TABLE):
+            commands.append({'delete': {'rule': {k: r[k] for k in ('family', 'table', 'chain', 'handle')}}})
+    if own:
+        commands.append({'delete': {'table': {'family': 'inet', 'name': TABLE}}})
+    commands.append({'add': {'table': {'family': 'inet', 'name': TABLE}}})
+    for direction in ('input', 'output'):
+        commands.append({'add': {'chain': {'family': 'inet', 'table': TABLE, 'name': direction,
+                         'type': 'filter', 'hook': direction, 'prio': -10, 'policy': 'accept'}}})
+        if peers:
+            for c in [dict(family='inet', table=TABLE, name=direction, hook=direction)] + [c for c in targets if c['hook'] == direction]:
+                rule = dict(family=c['family'], table=c['table'], chain=c['name'],
+                            expr=flow(role, address, peers, direction), comment=MARK + role + ':' + direction)
+                commands.append({'add' if (c['family'], c['table']) == ('inet', TABLE) else 'insert': {'rule': rule}})
+    if role == 'server':
+        commands.append({'add': {'rule': {'family': 'inet', 'table': TABLE, 'chain': 'input',
+            'expr': [match({'meta': {'key': 'l4proto'}}, 'tcp'), match(packet('tcp', 'dport'), 8388),
+                     {'counter': None}, {'drop': None}], 'comment': MARK + 'deny-other-nfs'}}})
+    return {'nftables': commands}
+
+
+def main():
+    if sys.argv[1:] not in ([], ['--check']):
+        raise ValueError('用法：firewall [--check]')
+    with open(LOCK, 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        p = run(['nft', '-j', 'list', 'ruleset'])
+        plain = run(['nft', 'list', 'ruleset'])
+        compat = set(re.findall(r'table\s+(ip|inet)\s+(\S+)\s+is managed by iptables', p.stderr + plain.stderr + plain.stdout))
+        data = json.dumps(transaction(json.loads(p.stdout), *settings(), compat=compat))
+        run(['nft', '-j', '-c', '-f', '-'], data)
+        if '--check' not in sys.argv:
+            run(['nft', '-j', '-f', '-'], data)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        print('NFS 防火墙错误：' + str(exc), file=sys.stderr)
+        sys.exit(1)
+NWM_FIREWALL_PY
+    write_managed_file /etc/systemd/system/nfs-wg-firewall.service <<EOF
+$MANAGED_MARKER
+[Unit]
+Description=NFS over WireGuard firewall
+After=nftables.service
+Before=wg-quick@wg0.service
+[Service]
+Type=oneshot
+ExecStart=$RUNTIME_DIR/firewall
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+    write_managed_file /etc/systemd/system/nftables.service.d/nfs-wg-manager.conf <<EOF
+$MANAGED_MARKER
+[Service]
+ExecStartPost=$RUNTIME_DIR/firewall
+ExecReload=$RUNTIME_DIR/firewall
+EOF
+    write_managed_file /etc/systemd/system/wg-quick@wg0.service.d/nfs-wg-manager.conf <<EOF
+$MANAGED_MARKER
+[Unit]
+Requires=nfs-wg-firewall.service
+After=nfs-wg-firewall.service
+EOF
+}
+
+start_firewall() {
+    systemctl daemon-reload
+    "$RUNTIME_DIR/firewall" --check
+    systemctl enable nfs-wg-firewall.service >/dev/null
+    systemctl restart nfs-wg-firewall.service
+}
+
 save_node_state() {
     local tmp
     tmp=$(mktemp "${NODE_FILE}.XXXXXX")
     {
+        printf 'ROLE=%s\n' "$ROLE"
         printf 'NODE_NAME=%s\n' "$NODE_NAME"
         printf 'WG_ADDRESS=%s\n' "$WG_ADDRESS"
         printf 'WG_SUBNET=%s\n' "$WG_SUBNET"
@@ -486,15 +708,31 @@ write_wg_config() {
 }
 
 write_nfs_config() {
-    local tmp
-    tmp=$(mktemp "${NFS_CONF_FILE}.XXXXXX")
-    cat > "$tmp" <<EOF
-# Managed by NFS_Wireguard_Manager
-# NFSv4 only over WireGuard. NFS service port is intentionally non-default.
+    local nfs_version block
+    nfs_version=$(dpkg-query -W -f='${Version}' nfs-kernel-server)
+    if dpkg --compare-versions "${nfs_version#*:}" lt 2.6; then
+        # Debian 11 / Ubuntu 20.04 use nfs-config.service and RPCNFSDOPTS.
+        systemctl cat nfs-config.service >/dev/null 2>&1 || die "此 NFS 版本需要 nfs-config.service，当前系统缺少该服务。"
+        NFS_LEGACY_CONFIG=1
+        block=$(cat <<EOF
+# BEGIN NFS_WG_MANAGER nfsd options
+RPCNFSDOPTS="-p ${NFS_PORT} -N 2 -N 3 -N 4.0 -N 4.2 -V 4.1 -U"
+# END NFS_WG_MANAGER nfsd options
+EOF
+)
+        replace_block /etc/default/nfs-kernel-server '# BEGIN NFS_WG_MANAGER nfsd options' '# END NFS_WG_MANAGER nfsd options' "$block"
+        if [[ -f $NFS_CONF_FILE ]] && grep -qF "$MANAGED_MARKER" "$NFS_CONF_FILE"; then
+            rm -f -- "$NFS_CONF_FILE"
+        fi
+    else
+        NFS_LEGACY_CONFIG=0
+        write_managed_file "$NFS_CONF_FILE" <<EOF
+$MANAGED_MARKER
 [nfsd]
 port = ${NFS_PORT}
 tcp = yes
 udp = no
+vers2 = no
 vers3 = no
 vers4 = yes
 vers4.0 = no
@@ -502,12 +740,28 @@ vers4.1 = yes
 vers4.2 = no
 rdma = no
 EOF
-    chmod 0644 "$tmp"
-    if [[ -f $NFS_CONF_FILE ]] && ! grep -qF "$MANAGED_MARKER" "$NFS_CONF_FILE"; then
-        die "$NFS_CONF_FILE 已存在且不是本工具生成的文件；请手工合并后重试。"
     fi
-    backup_once "$NFS_CONF_FILE"
-    mv -f "$tmp" "$NFS_CONF_FILE"
+    find_nfs_service
+    write_managed_file "/etc/systemd/system/${NFS_SERVICE}.service.d/nfs-wg-manager.conf" <<EOF
+$MANAGED_MARKER
+[Unit]
+Requires=wg-quick@wg0.service nfs-wg-firewall.service
+After=wg-quick@wg0.service nfs-wg-firewall.service
+EOF
+}
+
+verify_nfs_service() {
+    local versions listeners
+    [[ -r /proc/fs/nfsd/versions ]] || die "NFS 内核服务未运行。"
+    versions=" $(cat /proc/fs/nfsd/versions) "
+    [[ $versions == *" +4.1 "* && $versions != *" +2 "* && $versions != *" +3 "* && $versions != *" +4.2 "* ]] || die "NFS 协议限制未生效：$versions"
+    [[ $versions == *" -4.0 "* || $versions == *" -4 "* ]] || die "NFSv4.0 尚未关闭：$versions"
+    [[ -r /proc/fs/nfsd/portlist ]] || die "无法读取 NFS 内核监听端口。"
+    awk 'NF { if ($1 !~ /^tcp6?$/ || $2 != 8388) bad=1; found=1 } END { exit (bad || !found) }' /proc/fs/nfsd/portlist || die "NFS 内核监听端口或传输协议与 TCP 8388 不符。"
+    listeners=$(ss -H -lnt 'sport = :8388')
+    [[ -n $listeners ]] || die "NFS 未监听 TCP 8388；请检查 nfsd 配置是否生效。"
+    [[ -z $(ss -H -lnt 'sport = :2049') ]] || die "仍有 TCP 2049 监听，请检查是否有其他 NFS 配置覆盖。"
+    info "已核对 NFS TCP 8388 监听与仅启用 NFSv4.1。"
 }
 
 write_exports() {
@@ -541,6 +795,7 @@ find_nfs_service() {
 }
 
 start_services() {
+    start_firewall
     systemctl enable wg-quick@"$WG_INTERFACE" >/dev/null
     if systemctl is-active --quiet wg-quick@"$WG_INTERFACE"; then
         systemctl restart wg-quick@"$WG_INTERFACE"
@@ -549,6 +804,9 @@ start_services() {
     fi
 
     find_nfs_service
+    if (( NFS_LEGACY_CONFIG )); then
+        systemctl restart nfs-config.service
+    fi
     systemctl enable "$NFS_SERVICE" >/dev/null
     if systemctl is-active --quiet "$NFS_SERVICE"; then
         systemctl restart "$NFS_SERVICE"
@@ -556,13 +814,14 @@ start_services() {
         systemctl start "$NFS_SERVICE"
     fi
     exportfs -rav
+    verify_nfs_service
 }
 
 install_packages() {
-    info "安装 wireguard 和 nfs-kernel-server..."
+    info "安装 wireguard、nfs-kernel-server、nftables 和 python3..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y wireguard nfs-kernel-server
+    apt-get install -y wireguard nfs-kernel-server nftables python3
 }
 
 rollback_client_peer_update() {
@@ -588,7 +847,30 @@ rollback_client_peer_update() {
     if command -v exportfs >/dev/null 2>&1; then
         exportfs -ra || warn "已恢复文件，但重新加载 NFS 导出失败。"
     fi
+    if (( ADD_PEER_ROUTE_ADDED )); then
+        ip -4 route del "${ADD_PEER_ADDRESS}/32" dev "$WG_INTERFACE" || warn "撤销本次新增路由失败。"
+        ADD_PEER_ROUTE_ADDED=0
+    fi
+    "$RUNTIME_DIR/firewall" || warn "恢复本工程防火墙规则失败，请执行 --apply-firewall。"
     ADD_PEER_ROLLBACK=0
+}
+
+ensure_client_route() {
+    local peer_address=$1 route_state
+    route_state=$(ip -4 -j route show exact "${peer_address}/32" | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+print("missing" if not rows else "present" if len(rows) == 1 and rows[0].get("dev") == "wg0" and not rows[0].get("gateway") and rows[0].get("type", "unicast") == "unicast" else "conflict")
+') || die "读取客户端路由失败。"
+    case "$route_state" in
+        missing)
+            ip -4 route add "${peer_address}/32" dev "$WG_INTERFACE" || die "添加客户端回程路由失败。"
+            ADD_PEER_ADDRESS=$peer_address
+            ADD_PEER_ROUTE_ADDED=1
+            ;;
+        present) ;;
+        *) die "${peer_address}/32 已存在其他路由；未覆盖该路由。" ;;
+    esac
 }
 
 add_client_peer() {
@@ -637,6 +919,7 @@ add_client_peer() {
     public_key=${public_key_lines[0]}
     valid_key "$public_key" || die "公钥格式无效；请使用客户端脚本输出的 44 字符 WireGuard 公钥。"
 
+    [[ -x $RUNTIME_DIR/firewall ]] || die "请先完整运行本版本服务端安装器，以安装防火墙支持。"
     [[ -f $NODE_FILE && -f $PEERS_FILE && -s $WG_CONFIG && -f /etc/exports ]] || die "服务端配置不完整；请先完成 NFS Server 安装。"
     grep -qF "$MANAGED_MARKER" "$WG_CONFIG" || die "$WG_CONFIG 不是本工具生成的配置；为避免覆盖现有设置，已停止。"
     [[ -s $WG_KEY_FILE ]] || die "找不到服务端 WireGuard 私钥文件；请先完成 NFS Server 安装。"
@@ -645,6 +928,7 @@ add_client_peer() {
     command -v exportfs >/dev/null 2>&1 || die "找不到 exportfs 命令。"
     wg show "$WG_INTERFACE" >/dev/null 2>&1 || die "WireGuard 接口 $WG_INTERFACE 未运行；请先检查 NFS Server 服务。"
 
+    [[ $(state_get ROLE "$NODE_FILE") == server ]] || die "节点状态不是本版本服务端配置，请先完整运行安装器。"
     NODE_NAME=$(state_get NODE_NAME "$NODE_FILE" || true)
     WG_ADDRESS=$(state_get WG_ADDRESS "$NODE_FILE" || true)
     WG_SUBNET=$(state_get WG_SUBNET "$NODE_FILE" || true)
@@ -692,15 +976,21 @@ add_client_peer() {
     ADD_PEER_SYNC_FILE=$(mktemp "${WG_CONFIG}.syncconf.XXXXXX")
     wg-quick strip "$WG_INTERFACE" > "$ADD_PEER_SYNC_FILE" || die "生成 WireGuard 运行配置失败。"
     wg syncconf "$WG_INTERFACE" "$ADD_PEER_SYNC_FILE" || die "应用 WireGuard 客户端 Peer 失败。"
+    ensure_client_route "$peer_address"
+    "$RUNTIME_DIR/firewall" || die "更新 NFS 防火墙失败。"
     exportfs -ra || die "重新加载 NFS 导出失败。"
     ADD_PEER_ROLLBACK=0
 
     info "已添加客户端 Peer：${peer_name} (${peer_address})。"
-    info "WireGuard 和 NFS 导出已在线更新；无需重新安装软件包。"
+    info "WireGuard、回程路由、NFS 导出和防火墙已在线更新。"
 }
 
 main() {
     local current
+    if [[ ${1:-} == --apply-firewall && $# == 1 ]]; then
+        apply_saved_firewall
+        return
+    fi
     if [[ "${1:-}" == "--add-client-peer" ]]; then
         shift
         add_client_peer "$@"
@@ -709,6 +999,9 @@ main() {
     (($# == 0)) || die "不支持的位置参数；请使用 --help 查看用法。"
     install_packages
     ensure_manager_wg_config
+    local saved_role
+    saved_role=$(state_get ROLE "$NODE_FILE" || true)
+    [[ -z $saved_role || $saved_role == "$ROLE" ]] || die "同一机器不能混用本工程的服务端与客户端角色。"
 
     current=$(state_get NODE_NAME "$NODE_FILE" || true)
     NODE_NAME=$(prompt "本机节点名称（NFS Server 示例：ddps_nft）" "${current:-ddps_nft}")
@@ -743,10 +1036,11 @@ main() {
 
     collect_peers
     validate_peer_file
+    load_or_create_key
+    install_firewall_support
     mv -f "$NEW_PEERS_FILE" "$PEERS_FILE"
     chmod 0600 "$PEERS_FILE"
     save_node_state
-    load_or_create_key
     write_wg_config
     write_nfs_config
     write_exports
@@ -758,7 +1052,7 @@ main() {
     printf 'WireGuard 端口：%s/udp\n' "$WG_LISTEN_PORT"
     printf 'NFS 媒体目录：%s\n' "$MEDIA_ROOT"
     printf 'NFS 服务端口：%s/tcp\n' "$NFS_PORT"
-    printf '\n下一步：在 Jellyfin 客户端 Peer 中填写本机公钥和公网 Endpoint；若本次已在客户端 Peer 清单中录入客户端公钥，无需再运行添加命令。在本机 nftables 放行 wg0 上的 TCP 8388。\n'
+    printf '\n下一步：在 Jellyfin 客户端 Peer 中填写本机公钥和公网 Endpoint；若本次已在客户端 Peer 清单中录入客户端公钥，无需再运行添加命令。wg0 上 TCP 8388 已自动管理；请自行放行公网 WireGuard UDP 端口。\n'
 }
 
 main "$@"
