@@ -1,4 +1,4 @@
-# NFS_Wireguard_Manager 3.0.0
+# NFS_Wireguard_Manager 3.1
 
 用两个交互式 Bash 脚本，在 Debian 11/12/13 或 Ubuntu 20.04/22.04/24.04 上配置：
 
@@ -51,7 +51,7 @@ docker run -d \
 在线执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AthesFrey/NFS_Wireguard_Manager/refs/heads/main/install-jellyfin-client.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/AthesFrey/NFS_Wireguard_Manager/refs/heads/main/v3.1/scripts/install-jellyfin-client.sh | sudo bash
 ```
 
 脚本询问“本机”时，指当前 Jellyfin VPS；“Peer”提示指远端 NFS VPS。示例中 `hhost_jf` 是 Jellyfin 节点，`ddps_nft` 是 NFS 节点，地址分别为 `10.96.0.1` 和 `10.96.0.2`：
@@ -67,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/AthesFrey/NFS_Wireguard_Manager/ref
 | `ddps_nft` 的 WireGuard 公钥 | NFS VPS 安装器输出的公钥 | 填服务端输出的一整行 44 字符公钥；不填节点名或 IP。 |
 | `ddps_nft` 的公网 Endpoint | `203.0.113.10:35669` | 填 NFS VPS 公网 IP/域名及其 WireGuard UDP 监听端口；端口默认是 `35669`。 |
 | Jellyfin 宿主机媒体根目录 | `/opt/jellyfin/media` | 保持默认时直接回车。 |
-| 本地挂载目录 | `/opt/jellyfin/media/ddps_nft` | 默认在媒体根目录下；容器内路径是 `/media/ddps_nft`。 |
+| 本地挂载目录 | `/opt/jellyfin/media/ddps_nft` | 必须位于媒体根目录下，只能使用安全路径字符；输入非法路径时会停留在此提示重新输入。容器内路径是 `/media/ddps_nft`。 |
 | Jellyfin Docker 容器名 | `jellyfin` | 容器名不同才修改。 |
 
 “Peer 名称、WireGuard 地址、公钥”是三个不同输入：在 Jellyfin 客户端连接示例中的 NFS Peer，分别填 `ddps_nft`、`10.96.0.2`、NFS VPS 的公钥。首次部署时可以直接粘贴离线创建的本机私钥和对端公钥；Endpoint 仍须填写 NFS VPS 的公网 IP 或域名及端口。
@@ -78,14 +78,14 @@ curl -fsSL https://raw.githubusercontent.com/AthesFrey/NFS_Wireguard_Manager/ref
 /media/storage-a
 ```
 
-脚本挂载成功后，如果检测到现有 `jellyfin` 容器正在运行，会重启一次容器，使新的 NFS 子目录出现在 `/media` 映射中。容器名默认是 `jellyfin`，也可以在提示中修改。
+脚本挂载成功后，如果检测到现有 `jellyfin` 容器正在运行，会重启一次容器，使新的 NFS 子目录出现在 `/media` 映射中。容器名默认是 `jellyfin`，也可以在提示中修改。每个 Peer 的名称、隧道地址、公钥、Endpoint 和挂载目录都会单独校验；地址、公钥、Endpoint 或挂载目录不合规时，脚本会反复提示当前字段。
 
 ## NFS Server 节点
 
 在线执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AthesFrey/NFS_Wireguard_Manager/refs/heads/main/install-nfs-server.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/AthesFrey/NFS_Wireguard_Manager/refs/heads/main/v3.1/scripts/install-nfs-server.sh | sudo bash
 ```
 
 脚本安装 `wireguard` 和 `nfs-kernel-server`。脚本询问“本机”时，指当前 NFS VPS；示例中它叫 `ddps_nft`，隧道地址为 `10.96.0.2`：
@@ -123,7 +123,8 @@ NFS Server 使用 NFSv4 根导出，客户端挂载源为：
 1. 离线准备两端各自的密钥对；部署时只把 NFS 私钥输入 NFS VPS 的安装器，只把 Jellyfin 私钥输入 Jellyfin VPS 的安装器。两端互相交换公钥，绝不交换私钥。
 2. 在 NFS VPS 运行 `install-nfs-server.sh`。输入 Jellyfin Peer 名称 `hhost_jf`、地址 `10.96.0.1` 和 Jellyfin 公钥；在隐藏提示中粘贴 NFS 本机私钥。
 3. 在 Jellyfin VPS 运行 `install-jellyfin-client.sh`。输入 NFS Peer 名称 `ddps_nft`、地址 `10.96.0.2`、NFS 公钥和 NFS VPS 公网 Endpoint；在隐藏提示中粘贴 Jellyfin 本机私钥。
-4. 在 Jellyfin 中添加容器内路径 `/media/ddps_nft` 作为媒体库路径。若首次安装时未配置 Jellyfin Peer，可稍后使用下方的 `--add-client-peer` 模式添加。
+4. 按下方防火墙规则配置两端安全组和 nftables。NFS Server 需要允许入站 UDP 35669；Jellyfin VPS 只需允许出站 UDP 访问 NFS Server 的 35669。
+5. 在 Jellyfin 中添加容器内路径 `/media/ddps_nft` 作为媒体库路径。若首次安装时未配置 Jellyfin Peer，可稍后使用下方的 `--add-client-peer` 模式添加。
 
 ### 将 Jellyfin 公钥加入 NFS Server
 
@@ -142,7 +143,7 @@ scp /tmp/hhost_jf.pub admin@203.0.113.10:/tmp/hhost_jf.pub
 接着在 **NFS VPS** 上运行下面命令。Peer 名称 `hhost_jf`、地址 `10.96.0.1` 和 `.pub` 内容，必须分别对应 Jellyfin VPS 的本机节点名、本机 WireGuard 地址和 Jellyfin 脚本输出的公钥：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AthesFrey/NFS_Wireguard_Manager/refs/heads/main/install-nfs-server.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/AthesFrey/NFS_Wireguard_Manager/refs/heads/main/v3.1/scripts/install-nfs-server.sh | sudo bash -s -- \
   --add-client-peer \
   --peer-name hhost_jf \
   --peer-address 10.96.0.1 \
@@ -153,25 +154,33 @@ curl -fsSL https://raw.githubusercontent.com/AthesFrey/NFS_Wireguard_Manager/ref
 
 节点名称可以自定义；本机和 Peer 的 WireGuard 地址必须位于两端共同使用的网段内，默认网段为 `10.96.0.0/16`。在 NFS Server 的客户端 Peer 提示中，名称填 Jellyfin 节点名 `hhost_jf`，地址填 `10.96.0.1`，公钥填 Jellyfin VPS 的公钥；不要把名称、地址或私钥填进公钥栏。
 
-## nftables 手工规则
+## 防火墙和 nftables 手工规则
 
-脚本不会修改防火墙。请根据自己的 nftables table 和 chain 名称手工添加规则。
+脚本不会修改云安全组、nftables 或 UFW。云平台安全组负责公网网卡，nftables 负责主机本地过滤；两层都需要符合下面的方向。
 
-公网入口至少需要：
+**NFS Server：**
+
+- 开放入站 UDP `35669`，供 Jellyfin VPS 发起 WireGuard 握手。固定公网地址时只允许 Jellyfin VPS 的公网 IP；地址变化时才放宽来源。
+- 允许来自 WireGuard 接口和 WireGuard 网段的 TCP `8388`，供 NFSv4.1 使用。不要从公网网卡开放 TCP `8388`。
+
+**Jellyfin VPS：**
+
+- 允许出站 UDP 访问 NFS Server 公网地址的 `35669`，供客户端发起 WireGuard 连接。
+- 通常无需开放入站 UDP `35669`；客户端发起连接后，WireGuard 响应会沿已有连接返回。只有在你的网络策略明确阻断回包或需要固定入站连接时，才另外评估入站规则。
+
+如果 Jellyfin VPS 也启用了出站 nftables，可按实际 NFS Server 公网地址增加类似规则（示例地址需替换）：
 
 ```text
-UDP 35669：WireGuard
+ip daddr 203.0.113.10 udp dport 35669 accept
 ```
 
-如果 Peer 使用固定公网 IP，建议只允许这些 IP 访问 UDP 35669。动态公网 IP 时可以放宽 UDP 35669，但 WireGuard 公钥仍然会拒绝未授权 Peer。
-
-NFS 只允许 WireGuard 接口和 WireGuard 网段访问：
+NFS Server 上允许 NFS 业务的示例规则为：
 
 ```text
 iifname "wg0" ip saddr 10.96.0.0/16 tcp dport 8388 accept
 ```
 
-请不要从公网网卡放行 TCP 8388，也不要把 NFS 2049 暴露到公网。NFS 配置只启用 NFSv4.1，因此不需要为本方案开放 rpcbind 或 NFSv3 的辅助端口。
+这里的 `8388/tcp` 是 WireGuard 隧道内的 NFS 服务端口；公网只需要暴露 NFS Server 的 `35669/udp`。本方案只启用 NFSv4.1，因此不需要开放公网 TCP/UDP `2049`、`rpcbind` 或 NFSv3 辅助端口。
 
 ## 验证命令
 
@@ -204,8 +213,8 @@ WireGuard 和 NFS 服务端口分别为 `35669/udp` 和 `8388/tcp`，不是标�
 
 - 每个 NFS 挂载独立使用 `nofail`，某个 NFS VPS 离线时其他媒体源仍可使用。
 - 离线的 NFS 路径可能在 Jellyfin 中显示为空；恢复连接后执行 `mount <挂载目录>`，再按需扫描媒体库。
-- 如果 `wg show` 没有 latest handshake，先检查双方公钥、Endpoint、UDP 35669 和 `AllowedIPs`。
-- 如果 WireGuard 正常但挂载失败，检查服务端是否监听 TCP 8388、nftables 是否允许 `wg0`、以及 NFS 导出客户端地址是否正确。
+- 如果 `wg show` 没有 latest handshake，先检查 NFS Server 入站 UDP 35669、Jellyfin VPS 出站 UDP 35669、双方公钥、NFS Server 公网 Endpoint 和 `AllowedIPs`。
+- 如果 WireGuard 正常但挂载失败，检查 NFS Server 是否监听 TCP 8388、NFS Server 的 `wg0` 规则是否允许 Jellyfin 隧道地址、以及 NFS 导出客户端地址是否正确。公网只检查 UDP 35669，不要用公网地址测试 TCP 8388。
 - 如果媒体目录为空，确认 NFS Server 的真实磁盘已挂载到脚本输入的目录。
 - `root_squash` 会把 NFS 客户端的 root 身份映射为匿名用户；请确保媒体目录和文件对该匿名用户（通常需要目录 `x`、文件 `r`）可读。
 

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.1.0"
 readonly STATE_DIR="/etc/nfs-wg-manager"
 readonly WG_DIR="/etc/wireguard"
 readonly WG_INTERFACE="wg0"
@@ -249,8 +249,24 @@ valid_key() {
 
 valid_abs_path() {
     local path=$1
-    [[ $path == /* ]] || return 1
-    [[ $path == "/" || $path =~ ^/[A-Za-z0-9._/@+~-]+$ ]]
+    local normalized
+    normalized=$(normalize_abs_path "$path") || return 1
+    [[ $normalized == "$path" ]]
+}
+
+normalize_abs_path() {
+    local path=$1 component
+    local -a components
+    [[ $path == /* && ($path == "/" || $path =~ ^/[A-Za-z0-9._/@+~-]+$) ]] || return 1
+    while [[ $path != "/" && $path == */ ]]; do
+        path=${path%/}
+    done
+    [[ $path != *//* ]] || return 1
+    IFS=/ read -r -a components <<< "${path#/}"
+    for component in "${components[@]}"; do
+        [[ -n $component && $component != . && $component != .. ]] || return 1
+    done
+    printf '%s' "$path"
 }
 
 backup_once() {
@@ -381,40 +397,65 @@ collect_peers() {
 
     if [[ -s $PEERS_FILE ]] && confirm "保留当前 Jellyfin 客户端 Peer 清单？重新输入请选择 n" "Y"; then
         cp -f "$PEERS_FILE" "$NEW_PEERS_FILE"
-    else
-        : > "$NEW_PEERS_FILE"
+        if validate_peer_file; then
+            return 0
+        fi
+        confirm "当前 Jellyfin Peer 清单字段无效或重复；是否重新输入完整清单？" "Y" || die "未更改不合规的 Peer 清单。"
+    fi
+
+    : > "$NEW_PEERS_FILE"
+    while :; do
         while :; do
             name=$(prompt "Jellyfin 客户端 Peer 名称（填写客户端节点名，例如 hhost_jf；留空结束）" "")
-            [[ -z $name ]] && break
-            valid_name "$name" || { warn "名称只能包含字母、数字、点、下划线和短横线。"; continue; }
-            [[ $name != "$NODE_NAME" ]] || { warn "Peer 名称不能与本机相同。"; continue; }
-            peer_exists_in_file "$NEW_PEERS_FILE" "$name" && { warn "Peer 名称重复。"; continue; }
-
-            old_ip=$(old_peer_field "$name" 2 || true)
-            old_key=$(old_peer_field "$name" 3 || true)
-            peer_ip=$(prompt "Jellyfin 客户端 ${name} 的 WireGuard IPv4 地址（例如 10.96.0.1）" "${old_ip:-10.96.0.1}")
-            valid_ipv4 "$peer_ip" || { warn "IPv4 地址无效。"; continue; }
-            ipv4_in_cidr "$peer_ip" "$WG_SUBNET" || { warn "Peer 地址不在 WireGuard 网段 $WG_SUBNET 内。"; continue; }
-            [[ $peer_ip != "$WG_ADDRESS" ]] || { warn "Peer 地址不能与本机相同。"; continue; }
-            peer_ip_exists_in_file "$NEW_PEERS_FILE" "$peer_ip" && { warn "Peer WireGuard 地址重复。"; continue; }
-            public_key=$(prompt "Jellyfin 客户端 ${name} 输出的 WireGuard 公钥（一行 44 字符，不是名称或 IP）" "$old_key")
-            valid_key "$public_key" || { warn "WireGuard 公钥格式无效。"; continue; }
-            printf '%s|%s|%s\n' "$name" "$peer_ip" "$public_key" >> "$NEW_PEERS_FILE"
+            [[ -z $name ]] && return 0
+            valid_name "$name" || { warn "名称只能包含字母、数字、点、下划线和短横线。请重新输入 Peer 名称。"; continue; }
+            [[ $name != "$NODE_NAME" ]] || { warn "Peer 名称不能与本机相同。请重新输入 Peer 名称。"; continue; }
+            peer_exists_in_file "$NEW_PEERS_FILE" "$name" && { warn "Peer 名称重复。请重新输入 Peer 名称。"; continue; }
+            break
         done
-    fi
+
+        old_ip=$(old_peer_field "$name" 2 || true)
+        old_key=$(old_peer_field "$name" 3 || true)
+        while :; do
+            peer_ip=$(prompt "Jellyfin 客户端 ${name} 的 WireGuard IPv4 地址（例如 10.96.0.1）" "${old_ip:-10.96.0.1}")
+            if valid_ipv4 "$peer_ip" && ipv4_in_cidr "$peer_ip" "$WG_SUBNET" && [[ $peer_ip != "$WG_ADDRESS" ]] && ! peer_ip_exists_in_file "$NEW_PEERS_FILE" "$peer_ip"; then
+                break
+            fi
+            warn "IPv4 地址无效、超出 WireGuard 网段、与本机冲突或已被使用。请重新输入 ${name} 的地址。"
+        done
+
+        while :; do
+            public_key=$(prompt "Jellyfin 客户端 ${name} 输出的 WireGuard 公钥（一行 44 字符，不是名称或 IP）" "$old_key")
+            if valid_key "$public_key" && ! peer_key_exists_in_file "$NEW_PEERS_FILE" "$public_key"; then
+                break
+            fi
+            warn "WireGuard 公钥格式无效或已被使用。请重新输入 ${name} 的公钥。"
+        done
+        printf '%s|%s|%s\n' "$name" "$peer_ip" "$public_key" >> "$NEW_PEERS_FILE"
+    done
 }
 
 validate_peer_file() {
     local name peer_ip public_key
+    local -A seen_names=() seen_ips=() seen_keys=()
     [[ -f $NEW_PEERS_FILE ]] || return 0
     while IFS='|' read -r name peer_ip public_key; do
         [[ -n ${name:-} ]] || continue
-        valid_name "$name" || die "Peer $name 的名称无效。"
-        if ! valid_ipv4 "$peer_ip" || ! ipv4_in_cidr "$peer_ip" "$WG_SUBNET"; then
-            die "Peer $name 的地址 $peer_ip 不在网段 $WG_SUBNET 内。"
+        if ! valid_name "$name" || [[ $name == "$NODE_NAME" ]] || [[ -n ${seen_names[$name]+x} ]]; then
+            warn "Peer 清单中的名称无效、重复或与本机同名：${name:-<空>}。"
+            return 1
         fi
-        [[ $peer_ip != "$WG_ADDRESS" ]] || die "Peer $name 的地址不能与本机相同。"
-        valid_key "$public_key" || die "Peer $name 的 WireGuard 公钥无效。"
+        if ! valid_ipv4 "$peer_ip" || ! ipv4_in_cidr "$peer_ip" "$WG_SUBNET" || [[ $peer_ip == "$WG_ADDRESS" ]] || [[ -n ${seen_ips[$peer_ip]+x} ]]; then
+            warn "Peer $name 的 WireGuard 地址无效、冲突或重复：${peer_ip:-<空>}。"
+            return 1
+        fi
+        if ! valid_key "$public_key" || [[ -n ${seen_keys[$public_key]+x} ]]; then
+            warn "Peer $name 的 WireGuard 公钥无效或重复。"
+            return 1
+        fi
+        seen_names[$name]=1
+        seen_ips[$peer_ip]=1
+        seen_keys[$public_key]=1
     done < "$NEW_PEERS_FILE"
 }
 
@@ -687,8 +728,14 @@ main() {
     valid_port "$WG_LISTEN_PORT" || die "WireGuard 端口无效。"
 
     current=$(state_get MEDIA_ROOT "$NODE_FILE" || true)
-    MEDIA_ROOT=$(prompt "NFS 导出的媒体目录" "${current:-$DEFAULT_MEDIA_ROOT}")
-    valid_abs_path "$MEDIA_ROOT" || die "媒体目录必须是无空格的绝对路径。"
+    while :; do
+        MEDIA_ROOT=$(prompt "NFS 导出的媒体目录" "${current:-$DEFAULT_MEDIA_ROOT}")
+        if MEDIA_ROOT=$(normalize_abs_path "$MEDIA_ROOT"); then
+            break
+        fi
+        warn "媒体目录必须是无空格、无路径穿越的绝对路径。请重新输入。"
+        current=""
+    done
     if [[ ! -d $MEDIA_ROOT ]]; then
         warn "$MEDIA_ROOT 不存在，将创建该目录；请确认实际媒体磁盘已经挂载。"
         install -d -m 0755 "$MEDIA_ROOT"
