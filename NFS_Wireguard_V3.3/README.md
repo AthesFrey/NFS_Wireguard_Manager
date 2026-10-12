@@ -43,7 +43,7 @@ wireguard nfs-kernel-server nftables iptables python3
 wireguard nfs-common nftables iptables python3
 ~~~
 
-脚本需要 root、apt-get、systemctl 和交互终端。--apply-firewall、--add-client-peer 属于已安装后的非交互操作。
+脚本需要 root、apt-get、systemctl 和交互终端。每次正常运行都会让你选择新安装、追加 Peer 或 Force 安装；--apply-firewall 是单独的防火墙维护操作。
 
 ## NFS Server
 
@@ -53,7 +53,11 @@ chmod +x /root/install-nfs-server.sh
 bash install-nfs-server.sh
 ~~~
 
-安装器会询问本机节点、WireGuard IPv4、网段、UDP 监听端口、NFS 导出目录以及 Jellyfin Peer。默认示例是 nft_srv1、10.96.0.2、10.96.0.0/16、35669 和 /srv/media。
+安装器会先询问本次操作：新安装、追加 Jellyfin Peer 或 Force 安装。已有服务端配置时，默认选择追加 Peer；该路径直接读取已保存的节点设置，不会再次询问主机名或重新安装软件。
+
+选择追加 Peer 后，按提示输入客户端名、WireGuard IPv4 地址和公钥文件路径。例如 sky_jf、10.96.0.10、/root/sky_jf.pub。脚本会在线更新 Peer 清单、WireGuard、回程路由、防火墙和 NFS 导出；如果在线 `exportfs` 重载失败，会显示真实错误，并重启 `nfs-server` 后重试一次。该重试可能短暂中断已有 NFS 会话；仍然失败时会恢复原配置并回滚本次 Peer 更新。
+
+新安装和 Force 安装会询问本机节点、WireGuard IPv4、网段、UDP 监听端口、NFS 导出目录以及 Jellyfin Peer。默认示例是 nft_srv1、10.96.0.2、10.96.0.0/16、35669 和 /srv/media。
 
 服务端只写现代 NFS 配置：
 
@@ -67,17 +71,6 @@ bash install-nfs-server.sh
 10.96.0.2:/
 ~~~
 
-新增 Jellyfin Peer：
-
-~~~bash
-sudo bash install-nfs-server.sh --add-client-peer \
-  --peer-name jf_srv1 \
-  --peer-address 10.96.0.1 \
-  --public-key-file /root/jf_srv1.pub
-~~~
-
-这一步在线更新 Peer 清单、WireGuard、回程路由、NFS 导出和两层防火墙规则；失败时恢复本次事务。
-
 ## Jellyfin Client
 
 ~~~bash
@@ -86,7 +79,9 @@ chmod +x /root/install-jellyfin-client.sh
 bash install-jellyfin-client.sh
 ~~~
 
-客户端会询问本机节点、WireGuard 地址、NFS Server Peer、公网 Endpoint、媒体根目录、挂载目录和 Docker 容器名。NFS Server 的挂载源固定为：
+客户端每次运行都会让你选择新安装、追加 NFS Server Peer 或 Force 安装；已有客户端配置时默认选择追加。追加路径保留节点名称、私钥、媒体根目录和容器设置，只询问新 NFS Server 的 WireGuard 地址、公钥、公网 Endpoint 和挂载目录，然后更新 WireGuard、路由、防火墙、fstab 和 automount。
+
+新安装和 Force 安装会询问本机节点、WireGuard 地址、NFS Server Peer、公网 Endpoint、媒体根目录、挂载目录和 Docker 容器名。NFS Server 的挂载源固定为：
 
 ~~~text
 10.96.0.2:/  ->  /opt/jellyfin/media/nft_srv1
@@ -100,19 +95,16 @@ bash install-jellyfin-client.sh
 
 脚本不会安装或重建 Jellyfin 镜像；已有容器的其他参数需要保留。
 
-## 强制覆盖安装
+## Force 安装和防火墙维护
 
-默认情况下，存在未标记配置时脚本停止。使用 --force 可覆盖冲突文件：
+在交互菜单中选择 `3) Force 安装` 可覆盖冲突配置。直接传入 `--force` 会把 Force 安装设为默认选项，但脚本仍会显示菜单。一般新安装会拒绝覆盖未标记文件：
 
 ~~~bash
 sudo bash install-nfs-server.sh --force
 sudo bash install-jellyfin-client.sh --force
-sudo bash install-nfs-server.sh --add-client-peer --force \
-  --peer-name jf_srv1 --peer-address 10.96.0.1 \
-  --public-key-file /root/jf_srv1.pub
 ~~~
 
---force 会覆盖没有项目标记的 WireGuard、NFS、systemd drop-in、运行 helper 和 Docker drop-in；已保存的节点变量、私钥和 Peer 清单仍作为默认值保留。/etc/exports、/etc/fstab 只替换本项目标记块，其他内容保留。覆盖前会创建 .nfs-wg-manager.bak，Peer 更新仍使用事务备份和失败回滚。
+Force 安装会覆盖没有项目标记的 WireGuard、NFS、systemd drop-in、运行 helper 和 Docker drop-in；已保存的节点变量、私钥和 Peer 清单仍作为默认值保留。/etc/exports、/etc/fstab 只替换本项目标记块，其他内容保留。覆盖前会创建 .nfs-wg-manager.bak；追加 Peer 仍使用事务备份和失败回滚。
 
 ## 防火墙架构
 
@@ -287,5 +279,5 @@ docker exec jellyfin ls -la /media/nft_srv1
 python3 -B NFS_Wireguard_V3.3/tests/test_runtime.py
 ~~~
 
-测试覆盖原生 inet filter、inet nfs_wg_manager、非空 iptables-managed ip filter/INPUT、IPv6 只读、iptables 规则回滚、强制覆盖、现代 NFS 配置、systemd drop-in、挂载传播和 Docker 依赖。
+测试覆盖原生 inet filter、inet nfs_wg_manager、非空 iptables-managed ip filter/INPUT、IPv6 只读、iptables 规则回滚、三种交互操作选择、双端追加 Peer、NFS 导出事务回滚、强制覆盖、现代 NFS 配置、systemd drop-in、挂载传播和 Docker 依赖。
 

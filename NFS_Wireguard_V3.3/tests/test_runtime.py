@@ -511,24 +511,216 @@ write_exports "$TEST_ROOT/exports" "$PEERS_FILE"
         self.assertNotIn('ddps_nft', source('server'))
         self.assertNotIn('hhost_jf', source('server') + source('client'))
 
-    def test_add_peer_transaction_and_rollback(self):
-        for failure in ['', 'sync', 'route', 'firewall', 'exports', 'exports-silent']:
+    def test_installers_offer_install_append_and_force_modes(self):
+        for role in ('server', 'client'):
+            text = source(role)
+            self.assertIn('1) 新安装 / 重新配置', text)
+            self.assertIn('2) 追加', text)
+            self.assertIn('3) Force 安装', text)
+            self.assertNotIn('--add-client-peer', text)
+            self.assertNotIn('--peer-name', text)
+            self.assertNotIn('--peer-address', text)
+            self.assertNotIn('--public-key-file', text)
+
+    def test_install_mode_menu_selects_all_three_operations(self):
+        expected = {'1': 'install|0', '2': 'append|0', '3': 'force|1'}
+        for role in ('server', 'client'):
+            for choice, value in expected.items():
+                with self.subTest(role=role, choice=choice):
+                    result = self.bash(role, '''
+ROLE=$TEST_ROLE
+NODE_FILE=$TEST_ROOT/node.conf
+PEERS_FILE=$TEST_ROOT/peers.tsv
+WG_CONFIG=$TEST_ROOT/wg0.conf
+FORCE_MODE=0
+prompt() { printf '%s' "$TEST_CHOICE"; }
+select_install_mode
+printf '%s|%s' "$INSTALL_MODE" "$FORCE_MODE"
+''', {'TEST_ROLE': role, 'TEST_CHOICE': choice})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(result.stdout.endswith(value), result.stdout)
+
+    def test_existing_install_defaults_to_append_without_running_install(self):
+        for role in ('server', 'client'):
+            state = self.path / role
+            state.mkdir()
+            node = state / 'node.conf'
+            node.write_text('ROLE=' + role + '\n')
+            (state / 'peers.tsv').write_text('')
+            (state / 'wg0.conf').write_text('managed\n')
+            body = '''
+ROLE=$TEST_ROLE
+NODE_FILE=$TEST_STATE/node.conf
+PEERS_FILE=$TEST_STATE/peers.tsv
+WG_CONFIG=$TEST_STATE/wg0.conf
+FORCE_MODE=0
+APPLY_FIREWALL_MODE=0
+prompt() { printf '%s\\n' "$1" >> "$TEST_STATE/prompts"; printf '2'; }
+install_packages() { touch "$TEST_STATE/installed"; }
+append_client_peer() { touch "$TEST_STATE/appended"; }
+append_server_peer() { touch "$TEST_STATE/appended"; }
+main
+'''
+            result = self.bash(role, body, {'TEST_ROLE': role, 'TEST_STATE': str(state)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((state / 'appended').exists())
+            self.assertFalse((state / 'installed').exists())
+            prompts = (state / 'prompts').read_text()
+            self.assertIn('输入 1、2 或 3', prompts)
+            self.assertNotIn('本机节点名称', prompts)
+
+    def test_client_interactive_append_preserves_existing_peer(self):
+        media = self.path / 'media'
+        media.mkdir()
+        old = ['nft_srv1', '10.96.0.2', 'A' * 43 + '=', '203.0.113.10:35669', str(media / 'nft_srv1')]
+        (self.path / 'peers').write_text('|'.join(old) + '\n')
+        (self.path / 'input').write_text(
+            'sky_nfs\n10.96.0.10\n' + 'B' * 42 + 'A=\n203.0.113.20:35669\n' + str(media / 'sky_nfs') + '\n')
+        result = self.bash('client', '''
+STATE_DIR=$TEST_ROOT
+PEERS_FILE=$TEST_ROOT/peers
+MEDIA_ROOT=$TEST_ROOT/media
+NODE_NAME=jf_srv1
+WG_ADDRESS=10.96.0.1
+WG_SUBNET=10.96.0.0/16
+exec 8< "$TEST_ROOT/input"
+prompt() { local answer; IFS= read -r answer <&8; printf '%s' "$answer"; }
+collect_additional_peer
+validate_peer_file
+cp "$NEW_PEERS_FILE" "$TEST_ROOT/result"
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = (self.path / 'result').read_text().splitlines()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], '|'.join(old))
+        self.assertEqual(rows[1], 'sky_nfs|10.96.0.10|' + 'B' * 42 + 'A=|203.0.113.20:35669|' + str(media / 'sky_nfs'))
+
+    def test_client_peer_append_transaction_and_rollback(self):
+        for failure in ('', 'sync', 'route', 'firewall', 'systemd', 'timer'):
+            with self.subTest(failure=failure):
+                state = self.path / ('client-append-' + (failure or 'success'))
+                etc = state / 'etc'
+                wg_dir = etc / 'wireguard'
+                nwm = etc / 'nfs-wg-manager'
+                runtime = state / 'usr/local/libexec/nfs-wg-manager'
+                media = state / 'media'
+                media.mkdir(parents=True)
+                wg_dir.mkdir(parents=True)
+                nwm.mkdir(parents=True)
+                runtime.mkdir(parents=True)
+                key = 'A' * 43 + '='
+                old = ['nft_srv1', '10.96.0.2', key, '203.0.113.10:35669', str(media / 'nft_srv1')]
+                (nwm / 'client-peers.tsv').write_text('|'.join(old) + '\n')
+                (nwm / 'node.conf').write_text(
+                    'ROLE=client\nNODE_NAME=jf_srv1\nWG_ADDRESS=10.96.0.1\nWG_SUBNET=10.96.0.0/16\n'
+                    'WG_LISTEN_PORT=35669\nMEDIA_ROOT=' + str(media) + '\nCONTAINER_NAME=jellyfin\n')
+                (wg_dir / 'wg0.conf').write_text('# Managed by NFS_Wireguard_Manager\n[Interface]\n')
+                (wg_dir / 'wg0.key').write_text('synthetic-private-key\n')
+                fstab = self.path / 'etc/fstab'
+                fstab.parent.mkdir(parents=True, exist_ok=True)
+                fstab.write_text('# keep outside manager block\n# BEGIN NFS_WG_MANAGER\nold\n# END NFS_WG_MANAGER\n')
+                firewall = runtime / 'firewall'
+                firewall.write_text('''#!/bin/bash
+peer_file="$TEST_STATE/etc/nfs-wg-manager/client-peers.tsv"
+if [[ $TEST_FAILURE == firewall && $(wc -l < "$peer_file") -gt 1 ]]; then exit 1; fi
+cp "$peer_file" "$TEST_STATE/firewall-peers"
+''')
+                firewall.chmod(0o755)
+                mounts = runtime / 'mounts'
+                mounts.write_text('''#!/bin/bash
+case "$1" in
+    --absent|--verify|--reconcile) exit 0 ;;
+    *) exit 9 ;;
+esac
+''')
+                mounts.chmod(0o755)
+                (state / 'input').write_text(
+                    'sky_nfs\n10.96.0.10\n' + 'B' * 42 + 'A=\n203.0.113.20:35669\n' + str(media / 'sky_nfs') + '\n')
+                result = self.bash('client', '''
+STATE_DIR=$TEST_STATE/etc/nfs-wg-manager
+ROLE=client
+WG_INTERFACE=wg0
+NFS_PORT=8388
+WG_DIR=$TEST_STATE/etc/wireguard
+WG_CONFIG=$WG_DIR/wg0.conf
+WG_KEY_FILE=$WG_DIR/wg0.key
+PEERS_FILE=$STATE_DIR/client-peers.tsv
+NODE_FILE=$STATE_DIR/node.conf
+RUNTIME_DIR=$TEST_STATE/usr/local/libexec/nfs-wg-manager
+MANAGED_MARKER='# Managed by NFS_Wireguard_Manager'
+FSTAB_BEGIN='# BEGIN NFS_WG_MANAGER'
+FSTAB_END='# END NFS_WG_MANAGER'
+DOCKER_BEGIN='# BEGIN NFS_WG_MANAGER Docker ordering'
+DOCKER_END='# END NFS_WG_MANAGER Docker ordering'
+PEER_UPDATE_ROLLBACK=0
+PEER_UPDATE_ROUTE_ADDED=0
+PEER_UPDATE_ADDRESS=''
+PEER_UPDATE_BACKUP_DIR=''
+PEER_UPDATE_AUTO_DROPIN=''
+PEER_UPDATE_MOUNT_DIR_CREATED=0
+PEER_UPDATE_MOUNT_PATH=''
+PEER_UPDATE_SYNC_FILE=''
+trap cleanup EXIT
+exec 8< "$TEST_STATE/input"
+prompt() { local answer; IFS= read -r answer <&8; printf '%s' "$answer"; }
+wg() {
+    case $1 in
+        show) return 0 ;;
+        pubkey) cat >/dev/null; printf 'Cxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=\n' ;;
+        syncconf)
+            if [[ $TEST_FAILURE == sync && ! -e $TEST_STATE/sync-failed ]]; then touch "$TEST_STATE/sync-failed"; return 1; fi
+            cp "$PEERS_FILE" "$TEST_STATE/wg-peers"
+            ;;
+    esac
+}
+wg-quick() { printf '[Interface]\n'; }
+ip() {
+    if [[ $* == *' show '* ]]; then printf '[]';
+    elif [[ $* == *' add '* ]]; then
+        [[ $TEST_FAILURE != route ]] || return 1
+        printf '%s' "$*" > "$TEST_STATE/route"
+    else rm -f "$TEST_STATE/route"; fi
+}
+systemctl() {
+    case "$*" in
+        'show --property=LoadState --value nfs-wg-mounts.timer'|'show --property=LoadState --value nfs-wg-mounts.service') printf 'not-found' ;;
+        daemon-reload) [[ $TEST_FAILURE != systemd || $(wc -l < "$PEERS_FILE") -eq 1 ]] ;;
+        'enable --now nfs-wg-mounts.timer') [[ $TEST_FAILURE != timer || $(wc -l < "$PEERS_FILE") -eq 1 ]] ;;
+        *) return 0 ;;
+    esac
+}
+systemd-escape() { printf 'nwm-test.mount'; }
+docker() { return 1; }
+append_server_peer
+''', {'TEST_FAILURE': failure, 'TEST_STATE': str(state)})
+                self.assertEqual(result.returncode, 1 if failure else 0, result.stderr)
+                peers = (nwm / 'client-peers.tsv').read_text()
+                self.assertEqual(peers, '|'.join(old) + '\n' if failure else
+                                 '|'.join(old) + '\nsky_nfs|10.96.0.10|' + 'B' * 42 + 'A=|203.0.113.20:35669|' + str(media / 'sky_nfs') + '\n')
+                self.assertEqual((wg_dir / 'wg0.conf').read_text().count('[Peer]'), 0 if failure else 2)
+                self.assertEqual((state / 'route').exists(), not failure)
+                self.assertEqual(sum(line.startswith('10.96.0.10:/') for line in fstab.read_text().splitlines()), 0 if failure else 1)
+                self.assertIn('# keep outside manager block', fstab.read_text())
+
+    def test_interactive_nfs_peer_append_transaction_and_rollback(self):
+        for failure in ['', 'sync', 'route', 'firewall', 'exports', 'exports-silent', 'exports-restart']:
             with self.subTest(failure=failure):
                 state = self.path / ('case-' + (failure or 'success'))
                 state.mkdir()
                 (self.path / 'etc').mkdir(exist_ok=True)
                 exports = self.path / 'etc/exports'
                 exports.write_text('# pre-existing exports\n')
-                (state / 'peers').write_text('')
+                old_peer = 'jf_existing|10.96.0.1|' + 'A' * 43 + '=\n'
+                (state / 'peers').write_text(old_peer)
                 (state / 'node.conf').write_text('ROLE=server\nNODE_NAME=nft_srv1\nWG_ADDRESS=10.96.0.2\nWG_SUBNET=10.96.0.0/16\nWG_LISTEN_PORT=35669\nMEDIA_ROOT=/srv/media\n')
-                (state / 'wg0.conf').write_text('# Managed by NFS_Wireguard_Manager\n[Interface]\nAddress = 10.96.0.2/32\n')
+                (state / 'wg0.conf').write_text('# Managed by NFS_Wireguard_Manager\n[Interface]\nAddress = 10.96.0.2/32\n[Peer]\nAllowedIPs = 10.96.0.1/32\n')
                 (state / 'wg0.key').write_text('synthetic-test-key\n')
-                (state / 'jf_srv1.pub').write_text('A' * 43 + '=\n')
+                (state / 'sky_jf.pub').write_text('B' * 42 + 'A=\n')
                 runtime = state / 'runtime'
                 runtime.mkdir()
                 fw = runtime / 'firewall'
                 fw.write_text('''#!/bin/bash
-if [[ $TEST_FAILURE == firewall ]] && [[ -s $TEST_STATE/peers ]]; then exit 1; fi
+if [[ $TEST_FAILURE == firewall ]] && [[ $(wc -l < "$TEST_STATE/peers") -gt 1 ]]; then exit 1; fi
 cp "$TEST_STATE/peers" "$TEST_STATE/firewall-peers"
 ''')
                 fw.chmod(0o755)
@@ -552,6 +744,10 @@ ADD_PEER_EXPORTS_STAGE=''
 ADD_PEER_SYNC_FILE=''
 NEW_PEERS_FILE=''
 SYNC_FAILED=0
+exec 8<<<"sky_jf
+10.96.0.10
+$TEST_STATE/sky_jf.pub"
+prompt() { local answer; IFS= read -r answer <&8; printf '%s' "$answer"; }
 trap cleanup EXIT
 wg() {
     case $1 in
@@ -572,29 +768,49 @@ ip() {
     else rm -f "$STATE_DIR/route"; fi
 }
 exportfs() {
-    if [[ ($TEST_FAILURE == exports || $TEST_FAILURE == exports-silent) && -s $PEERS_FILE ]]; then
+    if [[ ($TEST_FAILURE == exports || $TEST_FAILURE == exports-silent || $TEST_FAILURE == exports-restart) && $(wc -l < "$PEERS_FILE") -gt 1 ]]; then
+        [[ $TEST_FAILURE != exports-restart || ! -e $STATE_DIR/nfs-restarted ]] || {
+            cp "$PEERS_FILE" "$STATE_DIR/export-peers"
+            return 0
+        }
         if [[ $TEST_FAILURE == exports ]]; then
             printf 'exportfs: synthetic invalid export\n' >&2
+        fi
+        if [[ $TEST_FAILURE == exports-restart ]]; then
+            printf 'exportfs: synthetic online reload failure\n' >&2
         fi
         return 7
     fi
     cp "$PEERS_FILE" "$STATE_DIR/export-peers"
 }
-add_client_peer --peer-name jf_srv1 --peer-address 10.96.0.1 --public-key-file "$STATE_DIR/jf_srv1.pub"
+systemctl() {
+    case "$*" in
+        'cat nfs-server.service') return 0 ;;
+        'restart nfs-server') [[ $TEST_FAILURE != exports-restart ]] || touch "$STATE_DIR/nfs-restarted" ;;
+        *) return 0 ;;
+    esac
+}
+append_client_peer
 ''', {'TEST_FAILURE': failure, 'TEST_STATE': str(state)})
-                self.assertEqual(result.returncode, 1 if failure else 0, result.stderr)
-                expected = '' if failure else 'jf_srv1|10.96.0.1|' + 'A' * 43 + '=\n'
+                success = failure in ('', 'exports-restart')
+                self.assertEqual(result.returncode, 0 if success else 1, result.stderr)
+                expected = old_peer + ('sky_jf|10.96.0.10|' + 'B' * 42 + 'A=\n' if success else '')
                 self.assertEqual((state / 'peers').read_text(), expected)
                 self.assertEqual((state / 'firewall-peers').read_text(), expected)
                 self.assertEqual((state / 'wg-peers').read_text(), expected)
-                self.assertEqual((state / 'route').exists(), not failure)
-                if failure:
+                self.assertEqual((state / 'route').exists(), success)
+                if not success:
                     self.assertEqual(exports.read_text(), '# pre-existing exports\n')
-                    self.assertNotIn('AllowedIPs', (state / 'wg0.conf').read_text())
+                    self.assertIn('AllowedIPs = 10.96.0.1/32', (state / 'wg0.conf').read_text())
+                    self.assertNotIn('AllowedIPs = 10.96.0.10/32', (state / 'wg0.conf').read_text())
                 if failure == 'exports':
                     self.assertIn('synthetic invalid export', result.stderr)
                 if failure == 'exports-silent':
-                    self.assertIn('exportfs -rav 退出码：7，未返回诊断信息。', result.stderr)
+                    self.assertIn('exportfs -rav 失败，退出码：7。', result.stderr)
+                    self.assertIn('exportfs -rav 未返回诊断信息。', result.stderr)
+                if failure == 'exports-restart':
+                    self.assertIn('exportfs 在线重载失败；重启 nfs-server 后再重试一次。', result.stderr)
+                    self.assertTrue((state / 'nfs-restarted').exists())
 
     def test_nfs_config_uses_only_modern_debian_configuration(self):
         result = self.bash('server', '''

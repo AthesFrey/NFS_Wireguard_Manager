@@ -31,7 +31,6 @@ NODE_NAME=""
 PRIVATE_KEY=""
 PUBLIC_KEY=""
 NFS_SERVICE=""
-ADD_CLIENT_PEER_MODE=0
 APPLY_FIREWALL_MODE=0
 FORCE_MODE=0
 ADD_PEER_ROLLBACK=0
@@ -44,7 +43,6 @@ ADD_PEER_SYNC_FILE=""
 
 for arg in "$@"; do
     case "$arg" in
-        --add-client-peer) ADD_CLIENT_PEER_MODE=1 ;;
         --apply-firewall) APPLY_FIREWALL_MODE=1 ;;
         --force) FORCE_MODE=1 ;;
     esac
@@ -91,13 +89,8 @@ usage() {
 恢复隧道内防火墙规则：sudo bash install-nfs-server.sh --apply-firewall [--force]
 公网 UDP 端口需自行放行；脚本仅管理 wg0 上的 NFS TCP 8388。
 
-已安装服务端后新增 Jellyfin 客户端 Peer：
-  sudo bash install-nfs-server.sh --add-client-peer [--force] \
-    --peer-name jf_srv1 --peer-address 10.96.0.1 \
-    --public-key-file /root/jf_srv1.pub
-
+正常运行时可选择新安装、追加 Jellyfin Peer 或强制安装。追加 Peer 时，按提示输入客户端名称、WireGuard 地址和 .pub 公钥文件路径。
 公钥文件必须只有一行 WireGuard 公钥。私钥必须留在客户端机器上。
-请传入客户端用 wg pubkey 派生的 .pub 文件，不要传 wg0.key；公钥和私钥编码相同，程序无法仅凭内容辨认误传的私钥。
 EOF
 }
 
@@ -110,7 +103,7 @@ done
 
 [[ $EUID -eq 0 ]] || die "请使用 root 运行此脚本。"
 [[ -r /etc/os-release ]] || die "找不到 /etc/os-release。"
-if (( ! ADD_CLIENT_PEER_MODE && ! APPLY_FIREWALL_MODE )); then
+if (( ! APPLY_FIREWALL_MODE )); then
     [[ -r /dev/tty ]] || die "需要交互终端；请直接在 VPS 上运行，或先下载脚本后用 bash 执行。"
 fi
 
@@ -118,14 +111,13 @@ fi
 . /etc/os-release
 [[ ${ID:-} == debian ]] || die "v3.3 仅支持 Debian stable，当前系统为 ${PRETTY_NAME:-unknown}。"
 
-if (( ADD_CLIENT_PEER_MODE || APPLY_FIREWALL_MODE )); then
+if (( APPLY_FIREWALL_MODE )); then
     [[ -d $STATE_DIR ]] || die "尚未安装 NFS_Wireguard_Manager NFS 服务端。"
 else
-    command -v apt-get >/dev/null 2>&1 || die "找不到 apt-get。"
     command -v systemctl >/dev/null 2>&1 || die "找不到 systemctl。"
 fi
 
-if (( ADD_CLIENT_PEER_MODE || APPLY_FIREWALL_MODE )); then
+if (( APPLY_FIREWALL_MODE )); then
     [[ -d $WG_DIR ]] || die "找不到 WireGuard 配置目录；请先完成 NFS Server 安装。"
 else
     mkdir -p "$STATE_DIR" "$WG_DIR" "$NFS_CONF_DIR"
@@ -888,7 +880,7 @@ write_exports() {
         done < "$peers_file"
         block+=$'\n'
     else
-        block+="# 尚未配置 Jellyfin 客户端 Peer；使用 --add-client-peer 添加客户端。"
+        block+="# 尚未配置 Jellyfin 客户端 Peer；重新运行安装器并选择追加 Peer。"
         block+=$'\n'
     fi
     block+="$EXPORTS_END"
@@ -905,10 +897,22 @@ reload_exports() {
     fi
     if [[ -n $output ]]; then
         printf '%s\n' "$output" >&2
-    else
-        printf 'exportfs -rav 退出码：%s，未返回诊断信息。\n' "$status" >&2
     fi
+    printf 'exportfs -rav 失败，退出码：%s。\n' "$status" >&2
+    [[ -n $output ]] || printf 'exportfs -rav 未返回诊断信息。\n' >&2
     return "$status"
+}
+
+reload_exports_with_restart() {
+    if reload_exports; then
+        return 0
+    fi
+    warn "exportfs 在线重载失败；重启 ${NFS_SERVICE:-NFS} 后再重试一次。"
+    systemctl restart "${NFS_SERVICE:-nfs-server}" || {
+        warn "重启 NFS 服务失败。"
+        return 1
+    }
+    reload_exports
 }
 
 find_nfs_service() {
@@ -964,7 +968,7 @@ rollback_client_peer_update() {
         fi
     fi
     if command -v exportfs >/dev/null 2>&1; then
-        reload_exports || warn "已恢复文件，但重新加载 NFS 导出失败。"
+        reload_exports_with_restart || warn "已恢复文件，但重新加载 NFS 导出失败。"
     fi
     if (( ADD_PEER_ROUTE_ADDED )); then
         ip -4 route del "${ADD_PEER_ADDRESS}/32" dev "$WG_INTERFACE" || warn "撤销本次新增路由失败。"
@@ -992,62 +996,20 @@ print("missing" if not rows else "present" if len(rows) == 1 and rows[0].get("de
     esac
 }
 
-add_client_peer() {
+append_client_peer() {
     local peer_name="" peer_address="" public_key_file="" public_key=""
     local key_file_size
     local -a public_key_lines=()
 
-    while (($#)); do
-        case "$1" in
-            --peer-name)
-                (($# >= 2)) || die "--peer-name 缺少参数。"
-                peer_name=$2
-                shift 2
-                ;;
-            --peer-address)
-                (($# >= 2)) || die "--peer-address 缺少参数。"
-                peer_address=$2
-                shift 2
-                ;;
-            --public-key-file)
-                (($# >= 2)) || die "--public-key-file 缺少参数。"
-                public_key_file=$2
-                shift 2
-                ;;
-            -h|--help)
-                usage
-                return 0
-                ;;
-            *)
-                die "未知参数：$1。请使用 --help 查看 Peer 添加用法。"
-                ;;
-        esac
-    done
-
-    [[ -n $peer_name ]] || die "必须提供 --peer-name。"
-    [[ -n $peer_address ]] || die "必须提供 --peer-address。"
-    [[ -n $public_key_file ]] || die "必须提供 --public-key-file。"
-    valid_name "$peer_name" || die "客户端 Peer 名称无效。"
-    valid_ipv4 "$peer_address" || die "客户端 Peer IPv4 地址无效。"
-    [[ $public_key_file == *.pub ]] || die "公钥文件名必须以 .pub 结尾；请勿指定 wg0.key。"
-    [[ -f $public_key_file && -r $public_key_file ]] || die "公钥文件不存在或不可读：$public_key_file。"
-    key_file_size=$(wc -c < "$public_key_file") || die "读取公钥文件失败。"
-    (( key_file_size <= 256 )) || die "公钥文件过大；文件应只有一行公钥。"
-    mapfile -t public_key_lines < "$public_key_file" || die "读取公钥文件失败。"
-    [[ ${#public_key_lines[@]} -eq 1 ]] || die "公钥文件必须恰好只有一行 WireGuard 公钥。"
-    public_key=${public_key_lines[0]}
-    valid_key "$public_key" || die "公钥格式无效；请使用客户端脚本输出的 44 字符 WireGuard 公钥。"
-
-    [[ -x $RUNTIME_DIR/firewall ]] || die "请先完整运行本版本服务端安装器，以安装防火墙支持。"
+    [[ -x $RUNTIME_DIR/firewall ]] || die "请先完整运行服务端安装器，以安装防火墙支持。"
     [[ -f $NODE_FILE && -f $PEERS_FILE && -s $WG_CONFIG && -f /etc/exports ]] || die "服务端配置不完整；请先完成 NFS Server 安装。"
-    if ! grep -qF "$MANAGED_MARKER" "$WG_CONFIG" && (( ! FORCE_MODE )); then
-        die "$WG_CONFIG 不是本工具生成的配置；请使用 --force 覆盖。"
-    fi
+    grep -qF "$MANAGED_MARKER" "$WG_CONFIG" || die "$WG_CONFIG 不是本工具生成的配置；请选择强制安装以覆盖。"
     [[ -s $WG_KEY_FILE ]] || die "找不到服务端 WireGuard 私钥文件；请先完成 NFS Server 安装。"
     command -v wg >/dev/null 2>&1 || die "找不到 wg 命令。"
     command -v wg-quick >/dev/null 2>&1 || die "找不到 wg-quick 命令。"
     command -v exportfs >/dev/null 2>&1 || die "找不到 exportfs 命令。"
     wg show "$WG_INTERFACE" >/dev/null 2>&1 || die "WireGuard 接口 $WG_INTERFACE 未运行；请先检查 NFS Server 服务。"
+    find_nfs_service
 
     [[ $(state_get ROLE "$NODE_FILE") == server ]] || die "节点状态不是本版本服务端配置，请先完整运行安装器。"
     NODE_NAME=$(state_get NODE_NAME "$NODE_FILE" || true)
@@ -1061,12 +1023,37 @@ add_client_peer() {
     ipv4_in_cidr "$WG_ADDRESS" "$WG_SUBNET" || die "服务端 WireGuard 地址不在已保存网段内。"
     valid_port "$WG_LISTEN_PORT" || die "服务端 WireGuard 端口状态无效。"
     valid_abs_path "$MEDIA_ROOT" || die "NFS 媒体目录状态无效。"
-    [[ $peer_name != "$NODE_NAME" ]] || die "客户端 Peer 名称不能与服务端节点名相同。"
-    ipv4_in_cidr "$peer_address" "$WG_SUBNET" || die "客户端地址 $peer_address 不在已配置网段 $WG_SUBNET 内。"
-    [[ $peer_address != "$WG_ADDRESS" ]] || die "客户端地址不能与服务端地址相同。"
-    peer_exists_in_file "$PEERS_FILE" "$peer_name" && die "客户端 Peer 名称已存在：$peer_name。"
-    peer_ip_exists_in_file "$PEERS_FILE" "$peer_address" && die "客户端 WireGuard 地址已被使用：$peer_address。"
-    peer_key_exists_in_file "$PEERS_FILE" "$public_key" && die "该公钥已存在于客户端 Peer 清单中。"
+
+    while :; do
+        peer_name=$(prompt "要追加的 Jellyfin 客户端 Peer 名称" "")
+        if valid_name "$peer_name" && [[ $peer_name != "$NODE_NAME" ]] && ! peer_exists_in_file "$PEERS_FILE" "$peer_name"; then
+            break
+        fi
+        warn "Peer 名称无效、与本机同名或已存在；请重新输入。"
+    done
+    while :; do
+        peer_address=$(prompt "${peer_name} 的 WireGuard IPv4 地址" "")
+        if valid_ipv4 "$peer_address" && ipv4_in_cidr "$peer_address" "$WG_SUBNET" && [[ $peer_address != "$WG_ADDRESS" ]] && ! peer_ip_exists_in_file "$PEERS_FILE" "$peer_address"; then
+            break
+        fi
+        warn "IPv4 地址无效、超出网段、与本机冲突或已被使用；请重新输入。"
+    done
+    while :; do
+        public_key_file=$(prompt "${peer_name} 的客户端公钥文件（.pub）" "/root/${peer_name}.pub")
+        if [[ $public_key_file == *.pub && -f $public_key_file && -r $public_key_file ]]; then
+            key_file_size=$(wc -c < "$public_key_file") || die "读取公钥文件失败。"
+            if (( key_file_size <= 256 )); then
+                mapfile -t public_key_lines < "$public_key_file" || die "读取公钥文件失败。"
+                if [[ ${#public_key_lines[@]} -eq 1 ]]; then
+                    public_key=${public_key_lines[0]}
+                    if valid_key "$public_key" && ! peer_key_exists_in_file "$PEERS_FILE" "$public_key"; then
+                        break
+                    fi
+                fi
+            fi
+        fi
+        warn "公钥文件必须是可读的 .pub 文件，且只包含一行未重复的 WireGuard 公钥。"
+    done
 
     PRIVATE_KEY=$(<"$WG_KEY_FILE")
     [[ -n $PRIVATE_KEY ]] || die "服务端 WireGuard 私钥为空。"
@@ -1084,7 +1071,7 @@ add_client_peer() {
     cp -a /etc/exports "$ADD_PEER_EXPORTS_STAGE"
     write_exports "$ADD_PEER_EXPORTS_STAGE" "$NEW_PEERS_FILE"
 
-    ADD_PEER_BACKUP_DIR=$(mktemp -d "${STATE_DIR}/.add-client-peer.XXXXXX")
+    ADD_PEER_BACKUP_DIR=$(mktemp -d "${STATE_DIR}/.peer-update.XXXXXX")
     cp -a "$PEERS_FILE" "$ADD_PEER_BACKUP_DIR/peers.tsv"
     cp -a "$WG_CONFIG" "$ADD_PEER_BACKUP_DIR/wg0.conf"
     cp -a /etc/exports "$ADD_PEER_BACKUP_DIR/exports"
@@ -1099,15 +1086,38 @@ add_client_peer() {
     wg syncconf "$WG_INTERFACE" "$ADD_PEER_SYNC_FILE" || die "应用 WireGuard 客户端 Peer 失败。"
     ensure_client_route "$peer_address"
     "$RUNTIME_DIR/firewall" || die "更新 NFS 防火墙失败。"
-    reload_exports || die "重新加载 NFS 导出失败。"
+    reload_exports_with_restart || die "重新加载 NFS 导出失败；Peer 更新已回滚。"
     ADD_PEER_ROLLBACK=0
 
-    info "已添加客户端 Peer：${peer_name} (${peer_address})。"
+    info "已追加客户端 Peer：${peer_name} (${peer_address})。"
     info "WireGuard、回程路由、NFS 导出和防火墙已在线更新。"
 }
 
+select_install_mode() {
+    local saved_role mode default_mode=1
+    saved_role=$(state_get ROLE "$NODE_FILE" || true)
+    [[ -z $saved_role || $saved_role == "$ROLE" ]] || die "同一机器不能混用本工程的服务端与客户端角色。"
+    if [[ -f $NODE_FILE && -f $PEERS_FILE && -s $WG_CONFIG ]]; then
+        default_mode=2
+    fi
+    (( FORCE_MODE )) && default_mode=3
+    cat <<'EOF'
+请选择本次操作：
+  1) 新安装 / 重新配置
+  2) 追加 Jellyfin 客户端 Peer（保留当前节点配置）
+  3) Force 安装（允许覆盖冲突配置）
+EOF
+    mode=$(prompt "输入 1、2 或 3" "$default_mode")
+    case "$mode" in
+        1) FORCE_MODE=0; INSTALL_MODE=install ;;
+        2) FORCE_MODE=0; INSTALL_MODE=append ;;
+        3) FORCE_MODE=1; INSTALL_MODE=force ;;
+        *) die "无效选择；请输入 1、2 或 3。" ;;
+    esac
+}
+
 main() {
-    local current arg
+    local current arg operation
     if (( ${APPLY_FIREWALL_MODE:-0} )); then
         for arg in "$@"; do
             [[ $arg == --apply-firewall || $arg == --force ]] || die "未知参数：$arg。"
@@ -1115,17 +1125,16 @@ main() {
         apply_saved_firewall
         return
     fi
-    if (( ADD_CLIENT_PEER_MODE )); then
-        local -a peer_args=()
-        for arg in "$@"; do
-            [[ $arg == --add-client-peer || $arg == --force ]] || peer_args+=("$arg")
-        done
-        add_client_peer "${peer_args[@]}"
-        return
-    fi
     for arg in "$@"; do
         [[ $arg == --force ]] || die "不支持的位置参数：$arg。请使用 --help 查看用法。"
     done
+    select_install_mode
+    operation=$INSTALL_MODE
+    if [[ $operation == append ]]; then
+        append_client_peer
+        return
+    fi
+    command -v apt-get >/dev/null 2>&1 || die "找不到 apt-get。"
     install_packages
     ensure_manager_wg_config
     local saved_role

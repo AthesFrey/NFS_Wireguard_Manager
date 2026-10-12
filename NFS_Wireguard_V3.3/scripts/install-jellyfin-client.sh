@@ -35,6 +35,14 @@ PUBLIC_KEY=""
 ACTIVE_MOUNTS=0
 APPLY_FIREWALL_MODE=0
 FORCE_MODE=0
+PEER_UPDATE_ROLLBACK=0
+PEER_UPDATE_ROUTE_ADDED=0
+PEER_UPDATE_ADDRESS=""
+PEER_UPDATE_BACKUP_DIR=""
+PEER_UPDATE_AUTO_DROPIN=""
+PEER_UPDATE_MOUNT_DIR_CREATED=0
+PEER_UPDATE_MOUNT_PATH=""
+PEER_UPDATE_SYNC_FILE=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -44,8 +52,15 @@ for arg in "$@"; do
 done
 
 cleanup() {
+    if (( PEER_UPDATE_ROLLBACK )); then
+        rollback_peer_update
+    fi
     if [[ -n ${NEW_PEERS_FILE:-} && -e $NEW_PEERS_FILE ]]; then
         rm -f -- "$NEW_PEERS_FILE"
+    fi
+    [[ -z ${PEER_UPDATE_SYNC_FILE:-} ]] || rm -f -- "$PEER_UPDATE_SYNC_FILE"
+    if [[ -n ${PEER_UPDATE_BACKUP_DIR:-} && -d $PEER_UPDATE_BACKUP_DIR ]]; then
+        rm -rf -- "$PEER_UPDATE_BACKUP_DIR"
     fi
 }
 trap cleanup EXIT
@@ -67,7 +82,8 @@ usage() {
     cat <<'EOF'
 用法：sudo bash install-jellyfin-client.sh [--force]
 
-脚本会交互式安装 WireGuard/NFS 客户端，并配置 Jellyfin 宿主机上的 NFS 挂载。
+正常运行时可选择新安装、追加 NFS Server Peer 或强制安装。
+追加 Peer 时只需输入新增服务端的节点名、WireGuard 地址、公钥、Endpoint 和本地挂载目录。
 手动重载 nftables 后恢复隧道内规则：sudo bash install-jellyfin-client.sh --apply-firewall [--force]
 公网 UDP 端口需自行放行；脚本仅管理 wg0 上的 NFS TCP 8388。
 首次运行时可隐藏粘贴本机离线私钥，直接回车则自动生成；重新运行时会保留已有私钥。
@@ -91,7 +107,6 @@ fi
 . /etc/os-release
 [[ ${ID:-} == debian ]] || die "v3.3 仅支持 Debian stable，当前系统为 ${PRETTY_NAME:-unknown}。"
 
-command -v apt-get >/dev/null 2>&1 || die "找不到 apt-get。"
 command -v systemctl >/dev/null 2>&1 || die "找不到 systemctl。"
 
 if (( APPLY_FIREWALL_MODE )); then
@@ -820,6 +835,50 @@ collect_peers() {
     done
 }
 
+collect_additional_peer() {
+    local name peer_ip public_key endpoint mount_path
+    NEW_PEERS_FILE=$(mktemp "${STATE_DIR}/client-peers.XXXXXX")
+    chmod 0600 "$NEW_PEERS_FILE"
+    cp -f "$PEERS_FILE" "$NEW_PEERS_FILE"
+
+    while :; do
+        name=$(prompt "要追加的 NFS Server Peer 名称（例如 nft_srv2）" "")
+        if valid_name "$name" && [[ $name != "$NODE_NAME" ]] && ! peer_exists_in_file "$NEW_PEERS_FILE" "$name"; then
+            break
+        fi
+        warn "Peer 名称无效、与本机同名或已存在；请重新输入。"
+    done
+    while :; do
+        peer_ip=$(prompt "NFS Server ${name} 的 WireGuard IPv4 地址" "")
+        if valid_ipv4 "$peer_ip" && ipv4_in_cidr "$peer_ip" "$WG_SUBNET" && [[ $peer_ip != "$WG_ADDRESS" ]] && ! peer_ip_exists_in_file "$NEW_PEERS_FILE" "$peer_ip"; then
+            break
+        fi
+        warn "IPv4 地址无效、超出网段、与本机冲突或已被使用；请重新输入。"
+    done
+    while :; do
+        public_key=$(prompt "NFS Server ${name} 的 WireGuard 公钥" "")
+        if valid_key "$public_key" && ! peer_key_exists_in_file "$NEW_PEERS_FILE" "$public_key"; then
+            break
+        fi
+        warn "WireGuard 公钥格式无效或已被使用；请重新输入。"
+    done
+    while :; do
+        endpoint=$(prompt "NFS Server ${name} 的公网 Endpoint（host:端口）" "")
+        valid_endpoint "$endpoint" && break
+        warn "Endpoint 必须是 host:port，端口范围 1-65535。请重新输入。"
+    done
+    while :; do
+        mount_path=$(prompt "${name} 的本地挂载目录" "${MEDIA_ROOT}/${name}")
+        mount_path=$(normalize_abs_path "$mount_path" 2>/dev/null || true)
+        if valid_mount_path "$mount_path" && ! peer_mount_exists_in_file "$NEW_PEERS_FILE" "$mount_path"; then
+            mount_path=$(realpath -m -- "$mount_path")
+            break
+        fi
+        warn "挂载目录必须是媒体根目录下不与现有 Peer 重叠的安全子目录。"
+    done
+    printf '%s|%s|%s|%s|%s\n' "$name" "$peer_ip" "$public_key" "$endpoint" "$mount_path" >> "$NEW_PEERS_FILE"
+}
+
 validate_peer_file() {
     local name peer_ip public_key endpoint mount_path
     local mount_real existing_mount
@@ -1220,6 +1279,142 @@ mount_configured_peers() {
     done < "$PEERS_FILE"
 }
 
+ensure_server_route() {
+    local peer_address=$1 route_state
+    route_state=$(ip -4 -j route show exact "${peer_address}/32" | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+print("missing" if not rows else "present" if len(rows) == 1 and rows[0].get("dev") == "wg0" and not rows[0].get("gateway") and rows[0].get("type", "unicast") == "unicast" else "conflict")
+') || die "读取 NFS Server 路由失败。"
+    case "$route_state" in
+        missing)
+            ip -4 route add "${peer_address}/32" dev "$WG_INTERFACE" || die "添加 NFS Server 路由失败。"
+            PEER_UPDATE_ADDRESS=$peer_address
+            PEER_UPDATE_ROUTE_ADDED=1
+            ;;
+        present) ;;
+        *) die "${peer_address}/32 已存在其他路由；未覆盖该路由。" ;;
+    esac
+}
+
+restore_optional_file() {
+    local saved=$1 target=$2
+    if [[ -f $saved ]]; then
+        mkdir -p "$(dirname "$target")"
+        cp -a "$saved" "$target" || return 1
+    else
+        rm -f -- "$target" || return 1
+    fi
+}
+
+rollback_peer_update() {
+    local sync_file=""
+    [[ -d ${PEER_UPDATE_BACKUP_DIR:-} ]] || return 0
+    cp -a "$PEER_UPDATE_BACKUP_DIR/peers.tsv" "$PEERS_FILE" || warn "恢复客户端 Peer 清单失败。"
+    cp -a "$PEER_UPDATE_BACKUP_DIR/wg0.conf" "$WG_CONFIG" || warn "恢复客户端 WireGuard 配置失败。"
+    cp -a "$PEER_UPDATE_BACKUP_DIR/fstab" /etc/fstab || warn "恢复 /etc/fstab 失败。"
+    restore_optional_file "$PEER_UPDATE_BACKUP_DIR/docker-dropin" /etc/systemd/system/docker.service.d/nfs-wg-manager.conf || warn "恢复 Docker 启动依赖失败。"
+    if [[ -n ${PEER_UPDATE_AUTO_DROPIN:-} ]]; then
+        restore_optional_file "$PEER_UPDATE_BACKUP_DIR/auto-dropin" "$PEER_UPDATE_AUTO_DROPIN" || warn "恢复新 Peer 的 automount 配置失败。"
+    fi
+    if command -v wg-quick >/dev/null 2>&1 && command -v wg >/dev/null 2>&1 && wg show "$WG_INTERFACE" >/dev/null 2>&1; then
+        if sync_file=$(mktemp "${WG_CONFIG}.rollback.XXXXXX" 2>/dev/null); then
+            if wg-quick strip "$WG_INTERFACE" > "$sync_file"; then
+                wg syncconf "$WG_INTERFACE" "$sync_file" || warn "已恢复文件，但恢复 WireGuard 运行状态失败。"
+            else
+                warn "已恢复文件，但无法生成 WireGuard 回滚配置。"
+            fi
+            rm -f -- "$sync_file"
+        else
+            warn "已恢复文件，但无法创建 WireGuard 回滚临时文件。"
+        fi
+    fi
+    if (( PEER_UPDATE_ROUTE_ADDED )); then
+        ip -4 route del "${PEER_UPDATE_ADDRESS}/32" dev "$WG_INTERFACE" || warn "撤销本次新增路由失败。"
+        PEER_UPDATE_ROUTE_ADDED=0
+    fi
+    "$RUNTIME_DIR/firewall" || warn "恢复本工程防火墙规则失败，请执行 --apply-firewall。"
+    systemctl daemon-reload || warn "已恢复文件，但重新加载 systemd 配置失败。"
+    if (( PEER_UPDATE_MOUNT_DIR_CREATED )); then
+        rmdir -- "$PEER_UPDATE_MOUNT_PATH" 2>/dev/null || true
+        PEER_UPDATE_MOUNT_DIR_CREATED=0
+    fi
+    systemctl enable --now nfs-wg-mounts.timer >/dev/null || warn "已恢复 Peer 配置，但无法重新启动 NFS 挂载恢复任务。"
+    PEER_UPDATE_ROLLBACK=0
+}
+
+load_saved_client_state() {
+    [[ -f $NODE_FILE && -f $PEERS_FILE && -s $WG_CONFIG && -s $WG_KEY_FILE ]] || die "未找到完整的 Jellyfin 客户端配置；请选择新安装。"
+    [[ $(state_get ROLE "$NODE_FILE") == "$ROLE" ]] || die "节点状态不是本版本 Jellyfin 客户端配置。"
+    grep -qF "$MANAGED_MARKER" "$WG_CONFIG" || die "$WG_CONFIG 不是本工具生成的配置；请选择 Force 安装以覆盖。"
+    [[ -x $RUNTIME_DIR/firewall && -x $RUNTIME_DIR/mounts ]] || die "客户端运行组件不完整；请选择 Force 安装重新配置。"
+    command -v wg >/dev/null 2>&1 || die "找不到 wg 命令。"
+    command -v wg-quick >/dev/null 2>&1 || die "找不到 wg-quick 命令。"
+    wg show "$WG_INTERFACE" >/dev/null 2>&1 || die "WireGuard 接口 $WG_INTERFACE 未运行；请检查客户端服务。"
+
+    NODE_NAME=$(state_get NODE_NAME "$NODE_FILE" || true)
+    WG_ADDRESS=$(state_get WG_ADDRESS "$NODE_FILE" || true)
+    WG_SUBNET=$(state_get WG_SUBNET "$NODE_FILE" || true)
+    WG_LISTEN_PORT=$(state_get WG_LISTEN_PORT "$NODE_FILE" || true)
+    MEDIA_ROOT=$(state_get MEDIA_ROOT "$NODE_FILE" || true)
+    CONTAINER_NAME=$(state_get CONTAINER_NAME "$NODE_FILE" || true)
+    valid_name "$NODE_NAME" || die "客户端节点状态无效。"
+    valid_ipv4 "$WG_ADDRESS" || die "客户端 WireGuard 地址状态无效。"
+    valid_cidr "$WG_SUBNET" || die "客户端 WireGuard 网段状态无效。"
+    ipv4_in_cidr "$WG_ADDRESS" "$WG_SUBNET" || die "客户端 WireGuard 地址不在已保存网段内。"
+    valid_port "$WG_LISTEN_PORT" || die "客户端 WireGuard 端口状态无效。"
+    normalize_abs_path "$MEDIA_ROOT" >/dev/null && [[ $MEDIA_ROOT != / ]] || die "Jellyfin 媒体根目录状态无效。"
+    valid_name "$CONTAINER_NAME" || die "Jellyfin 容器名称状态无效。"
+    PRIVATE_KEY=$(<"$WG_KEY_FILE")
+    [[ -n $PRIVATE_KEY ]] || die "客户端 WireGuard 私钥为空。"
+    PUBLIC_KEY=$(printf '%s' "$PRIVATE_KEY" | wg pubkey) || die "客户端 WireGuard 私钥无效。"
+}
+
+append_server_peer() {
+    local name peer_ip public_key endpoint mount_path auto_unit
+    load_saved_client_state
+    collect_additional_peer
+    validate_peer_file
+    IFS='|' read -r name peer_ip public_key endpoint mount_path < <(tail -n 1 "$NEW_PEERS_FILE")
+
+    PEER_UPDATE_BACKUP_DIR=$(mktemp -d "${STATE_DIR}/.peer-update.XXXXXX")
+    cp -a "$PEERS_FILE" "$PEER_UPDATE_BACKUP_DIR/peers.tsv"
+    cp -a "$WG_CONFIG" "$PEER_UPDATE_BACKUP_DIR/wg0.conf"
+    cp -a /etc/fstab "$PEER_UPDATE_BACKUP_DIR/fstab"
+    if [[ -f /etc/systemd/system/docker.service.d/nfs-wg-manager.conf ]]; then
+        cp -a /etc/systemd/system/docker.service.d/nfs-wg-manager.conf "$PEER_UPDATE_BACKUP_DIR/docker-dropin"
+    fi
+    auto_unit=$(systemd-escape --path --suffix=automount "$mount_path")
+    PEER_UPDATE_AUTO_DROPIN="/etc/systemd/system/${auto_unit}.d/nfs-wg-manager.conf"
+    if [[ -f $PEER_UPDATE_AUTO_DROPIN ]]; then
+        cp -a "$PEER_UPDATE_AUTO_DROPIN" "$PEER_UPDATE_BACKUP_DIR/auto-dropin"
+    fi
+    [[ -d $mount_path ]] || PEER_UPDATE_MOUNT_DIR_CREATED=1
+    PEER_UPDATE_MOUNT_PATH=$mount_path
+
+    PEER_UPDATE_ROLLBACK=1
+    stop_mount_recovery
+    mv -f "$NEW_PEERS_FILE" "$PEERS_FILE"
+    chmod 0600 "$PEERS_FILE"
+    write_wg_config
+    write_fstab
+    write_docker_ordering
+
+    PEER_UPDATE_SYNC_FILE=$(mktemp "${WG_CONFIG}.syncconf.XXXXXX")
+    wg-quick strip "$WG_INTERFACE" > "$PEER_UPDATE_SYNC_FILE" || die "生成 WireGuard 运行配置失败。"
+    wg syncconf "$WG_INTERFACE" "$PEER_UPDATE_SYNC_FILE" || die "应用 NFS Server Peer 失败。"
+    ensure_server_route "$peer_ip"
+    "$RUNTIME_DIR/firewall" || die "更新 Jellyfin 防火墙失败。"
+    systemctl daemon-reload || die "重新加载 systemd 与挂载配置失败。"
+    systemctl enable --now nfs-wg-mounts.timer >/dev/null || die "启动 NFS 挂载恢复任务失败。"
+    PEER_UPDATE_ROLLBACK=0
+
+    mount_configured_peers
+    maybe_restart_jellyfin
+    info "已追加 NFS Server Peer：${name} (${peer_ip})。"
+    info "WireGuard、路由、防火墙和 Jellyfin 媒体挂载配置已更新；没有重新安装客户端。"
+}
+
 maybe_restart_jellyfin() {
     local state mapping propagation
     command -v docker >/dev/null 2>&1 || return 0
@@ -1247,8 +1442,31 @@ install_packages() {
     apt-get install -y wireguard nfs-common nftables iptables python3
 }
 
+select_install_mode() {
+    local saved_role mode default_mode=1
+    saved_role=$(state_get ROLE "$NODE_FILE" || true)
+    [[ -z $saved_role || $saved_role == "$ROLE" ]] || die "同一机器不能混用本工程的服务端与客户端角色。"
+    if [[ -f $NODE_FILE && -f $PEERS_FILE && -s $WG_CONFIG ]]; then
+        default_mode=2
+    fi
+    (( FORCE_MODE )) && default_mode=3
+    cat <<'EOF'
+请选择本次操作：
+  1) 新安装 / 重新配置
+  2) 追加 NFS Server Peer（保留当前节点配置）
+  3) Force 安装（允许覆盖冲突配置）
+EOF
+    mode=$(prompt "输入 1、2 或 3" "$default_mode")
+    case "$mode" in
+        1) FORCE_MODE=0; INSTALL_MODE=install ;;
+        2) FORCE_MODE=0; INSTALL_MODE=append ;;
+        3) FORCE_MODE=1; INSTALL_MODE=force ;;
+        *) die "无效选择；请输入 1、2 或 3。" ;;
+    esac
+}
+
 main() {
-    local current arg
+    local current arg saved_role operation
     if (( ${APPLY_FIREWALL_MODE:-0} )); then
         for arg in "$@"; do
             [[ $arg == --apply-firewall || $arg == --force ]] || die "未知参数：$arg。"
@@ -1259,9 +1477,15 @@ main() {
     for arg in "$@"; do
         [[ $arg == --force ]] || die "未知参数：$arg。请使用 --help。"
     done
+    select_install_mode
+    operation=$INSTALL_MODE
+    if [[ $operation == append ]]; then
+        append_server_peer
+        return
+    fi
+    command -v apt-get >/dev/null 2>&1 || die "找不到 apt-get。"
     install_packages
     ensure_manager_wg_config
-    local saved_role
     saved_role=$(state_get ROLE "$NODE_FILE" || true)
     [[ -z $saved_role || $saved_role == "$ROLE" ]] || die "同一机器不能混用本工程的服务端与客户端角色。"
 
