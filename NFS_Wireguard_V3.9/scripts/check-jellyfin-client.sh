@@ -89,11 +89,11 @@ printf '\n'
 # NFS 挂载状态
 printf '【NFS 挂载状态】\n'
 if command -v findmnt >/dev/null 2>&1; then
-    MOUNT_COUNT=$(findmnt -t nfs,nfs4 -n --output TARGET,SOURCE | grep -c "^${MEDIA_ROOT}/" || echo "0")
+    MOUNT_COUNT=$(findmnt -t nfs,nfs4 -n --output TARGET,SOURCE 2>/dev/null | grep "^${MEDIA_ROOT}/" | wc -l)
     printf '  活跃挂载数量:  %s\n' "$MOUNT_COUNT"
     if [[ $MOUNT_COUNT -gt 0 ]]; then
         printf '  挂载详情:\n'
-        findmnt -t nfs,nfs4 -n --output TARGET,SOURCE,FSTYPE,OPTIONS | grep "^${MEDIA_ROOT}/" | sed 's/^/    /' || true
+        findmnt -t nfs,nfs4 -n --output TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null | grep "^${MEDIA_ROOT}/" | sed 's/^/    /' || true
     fi
 else
     printf '  findmnt 命令不可用\n'

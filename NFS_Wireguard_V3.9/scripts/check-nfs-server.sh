@@ -128,7 +128,7 @@ printf '\n'
 # NFS 导出状态
 printf '【NFS 导出状态】\n'
 if command -v exportfs >/dev/null 2>&1; then
-    EXPORT_COUNT=$(exportfs -s 2>/dev/null | grep -c "^${MEDIA_ROOT}" || echo "0")
+    EXPORT_COUNT=$(exportfs -s 2>/dev/null | grep "^${MEDIA_ROOT}" | wc -l)
     printf '  活跃导出数量:  %s\n' "$EXPORT_COUNT"
     if [[ $EXPORT_COUNT -gt 0 ]]; then
         printf '  导出详情:\n'
